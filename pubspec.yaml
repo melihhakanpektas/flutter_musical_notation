@@ -1,6 +1,6 @@
 name: flutter_musical_notation
 description: "A new Flutter package project."
-version: 0.0.1
+version: 0.0.2
 publish_to: "none"
 homepage:
 
@@ -11,7 +11,6 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-  google_fonts: 6.2.1
   flutter_music_core:
     path: ../flutter_music_core
 
@@ -25,6 +24,14 @@ dev_dependencies:
 
 # The following section is specific to Flutter packages.
 flutter:
+  # Nota sembolleri paketle birlikte gelir: sistem fontuna güvenmek
+  # platforma göre kırılıyordu (iOS'ta Noto Music yok; Android sürümleri
+  # arasında metrikler değişebilir). Noto Music, SIL OFL 1.1 lisanslıdır
+  # (fonts/OFL-NotoMusic.txt).
+  fonts:
+    - family: NotoMusic
+      fonts:
+        - asset: fonts/NotoMusic-Regular.ttf
 
   # To add assets to your package, add an assets section, like this:
   # assets:
