@@ -242,8 +242,20 @@ class MusicNotationPainter extends CustomPainter {
     final verticalRotatedNotes = <MidiNote>[];
 
     final noteSymbol = musicalValue.duration.symbol(musicalValue.type);
+    final headWidth = _headWidthFor(size, musicalValue.duration);
 
-    if (!isRest && musicalValue.midiNotes.isNotEmpty) {
+    if (!isRest && musicalValue.midiNotes.isNotEmpty && isHorizontalRotated) {
+      // Ters saplı notalar parçalardan kurulur: doğru eğimli notabaşı +
+      // tek ortak sap + doğru kıvrımlı bayrak (glif döndürme yönteminin
+      // ayna-bayrak / çift-sap / kopuk-sap kusurlarını giderir).
+      noteWidth = _drawStemDownChord(
+        canvas: canvas,
+        size: size,
+        value: musicalValue,
+        sortedDescending: sortedNoteList,
+        dx: accidentalsWidth + startDx,
+      );
+    } else if (!isRest && musicalValue.midiNotes.isNotEmpty) {
       for (var i = 0; i < sortedNoteList.length; i++) {
         final note = sortedNoteList[i];
         final noteIndexDifference = calculateNoteIndexDifferenceWithClefsFirstSpaceMidiNote(note);
@@ -251,40 +263,40 @@ class MusicNotationPainter extends CustomPainter {
         if (i != 0 &&
             !isPreviousRotatedVertical &&
             calculateIndexDifferenceBetweenFirstNoteToSecondNote(sortedNoteList[i - 1], note) ==
-                (isHorizontalRotated ? 1 : -1)) {
+                -1) {
           verticalRotatedNotes.add(note);
           isVerticalRotated = true;
           isPreviousRotatedVertical = true;
         } else {
           isPreviousRotatedVertical = false;
         }
-        noteWidth = drawNote(
+        drawNote(
           canvas: canvas,
           size: size,
           noteText: noteSymbol,
           dx: accidentalsWidth + startDx,
           isRest: isRest,
           indexFromClefFirstSpace: noteIndexDifference,
-          isHorizontalRotated: isHorizontalRotated,
           isVerticalRotated: isVerticalRotated,
           color: musicalValue.color,
         );
       }
+      noteWidth = headWidth;
       drawExtraLines(
         canvas: canvas,
         size: size,
         note: musicalValue,
-        isHorizontalRotated: isHorizontalRotated,
         dx: accidentalsWidth + startDx,
         noteSymbol: noteSymbol,
         verticalRotatedNotes: verticalRotatedNotes,
+        headWidth: headWidth,
       );
       if (musicalValue.dotted) {
         _drawAugmentationDots(
           canvas: canvas,
           notes: sortedNoteList,
           dx: accidentalsWidth + startDx,
-          noteWidth: noteWidth,
+          noteWidth: headWidth,
           color: musicalValue.color,
         );
       }
@@ -296,11 +308,155 @@ class MusicNotationPainter extends CustomPainter {
         dx: startDx,
         isRest: isRest,
         indexFromClefFirstSpace: 0,
-        isOnLine: true,
         color: musicalValue.color,
       );
     }
     return noteWidth + accidentalsWidth;
+  }
+
+  /// Süreye uygun notabaşı genişliği — ek çizgi ve nokta konumlandırmasının
+  /// ortak ölçüsü. Birlik notanın başı siyah baştan geniştir; ölçü süreye
+  /// göre seçilmezse ledger çizgisi başa ortalanmaz.
+  double _headWidthFor(Size size, MusicalDuration duration) {
+    final glyph = switch (duration) {
+      MusicalDuration.whole => '\u{1D15D}', // birlik: glifin kendisi baştır
+      MusicalDuration.half => '\u{1D157}', // boş notabaşı
+      _ => '\u{1D158}', // siyah notabaşı
+    };
+    final painter = noteTextPainter(glyph, fontSize: _fontSize(size.height))
+      ..layout(maxWidth: size.width);
+    return painter.width;
+  }
+
+  /// Baş merkezi y'si: staff'ın ilk boşluğundaki notanın merkezi + staff
+  /// pozisyonu başına yarım çizgi aralığı (uzatma noktalarıyla aynı formül).
+  double _headCenterY(int indexFromClefFirstSpace) {
+    final lineSpacing = (_measureExactHeight - _lineStrokeWidth + 1) / 4;
+    return _measureDescent +
+        _lineStrokeWidth / 2 -
+        1 +
+        lineSpacing * 3.5 +
+        indexFromClefFirstSpace * _noteSpaceHeight;
+  }
+
+  /// Ters saplı (stem-down) nota/akoru parçalardan kurar.
+  ///
+  /// - Notabaşı glifi (U+1D158 / yarımlıkta U+1D157): doğru eğim
+  /// - Tek ortak sap: en tiz başın merkezinden en pes başın ~3.5 boşluk
+  ///   altına, başların sol kenarında
+  /// - Bayrak (U+1D16E/U+1D16F) sap dibinde dikeyde çevrilir: kıvrım sağa
+  /// - İkili aralığın (second) başı sapın soluna ofsetlenir
+  double _drawStemDownChord({
+    required Canvas canvas,
+    required Size size,
+    required MusicalValue value,
+    required List<MidiNote> sortedDescending,
+    required double dx,
+  }) {
+    final fontSize = _fontSize(size.height);
+    final drawColor = value.color ?? color;
+    final headPainter = noteTextPainter(
+      value.duration == MusicalDuration.half ? '\u{1D157}' : '\u{1D158}',
+      fontSize: fontSize,
+      color: drawColor,
+    )..layout(maxWidth: size.width);
+    final headW = headPainter.width;
+
+    // Ön geçiş: her notabaşının sap'a göre yönü (bitişik ikilinin ikinci
+    // notası sapın soluna gider) ve porte konumu.
+    var previousWasLeft = false;
+    final indices = <int>[];
+    final leftSide = <bool>[];
+    for (var i = 0; i < sortedDescending.length; i++) {
+      final note = sortedDescending[i];
+      var left = false;
+      if (i != 0 &&
+          !previousWasLeft &&
+          calculateIndexDifferenceBetweenFirstNoteToSecondNote(sortedDescending[i - 1], note) ==
+              1) {
+        left = true;
+      }
+      previousWasLeft = left;
+      indices.add(calculateNoteIndexDifferenceWithClefsFirstSpaceMidiNote(note));
+      leftSide.add(left);
+    }
+
+    // Sola kayan notabaşı, aksidanlarla birlikte aksidan bölgesine girip
+    // çakışır (aksidanlar bloğun soluna, notabaşından bağımsız çizilir).
+    // Bu durumda tüm nota bloğunu bir notabaşı genişliği sağa alırız;
+    // aksidansız bitişik akorlar (sol kaymanın sorun olmadığı yer) etkilenmez.
+    final hasLeftHead = leftSide.any((left) => left);
+    final hasAccidental = sortedDescending.any((note) => note.accidental != null);
+    if (hasLeftHead && hasAccidental) dx += headW;
+
+    // Çizim geçişi.
+    for (var i = 0; i < sortedDescending.length; i++) {
+      headPainter.paint(
+        canvas,
+        Offset(dx + (leftSide[i] ? -headW : 0), indices[i] * _noteSpaceHeight - .5),
+      );
+    }
+
+    final topIndex = indices.reduce(min);
+    final bottomIndex = indices.reduce(max);
+
+    final stemPaint =
+        Paint()
+          ..color = drawColor
+          ..strokeWidth = _lineStrokeWidth * 0.8;
+    final stemX = dx + _lineStrokeWidth / 2;
+    final stemBottomY = _headCenterY(bottomIndex) + _noteSpaceHeight * 7;
+    canvas.drawLine(Offset(stemX, _headCenterY(topIndex)), Offset(stemX, stemBottomY), stemPaint);
+
+    if (value.duration.value >= MusicalDuration.eighth.value) {
+      final flagPainter = noteTextPainter(
+        value.duration == MusicalDuration.eighth ? '\u{1D16E}' : '\u{1D16F}',
+        fontSize: fontSize,
+        color: drawColor,
+      )..layout(maxWidth: size.width);
+      // Dikey ayna: kıvrım yönü korunur (sağa), bağlantı ucu sap dibine
+      // gelir. Combining flag glifinin advance genişliği sıfır olduğundan
+      // yatay ofset de glif YÜKSEKLİĞİNE ölçeklenir; değerler NotoMusic
+      // için görsel kalibrasyondur (sol kenar sapla hizalı, üst uç sap
+      // dibine değer).
+      const flagDx = 0.021;
+      const flagDy = 0.31;
+      canvas.save();
+      canvas.translate(stemX, stemBottomY);
+      canvas.scale(1, -1);
+      flagPainter.paint(canvas, Offset(flagPainter.height * flagDx, -flagPainter.height * flagDy));
+      canvas.restore();
+    }
+
+    // Ek çizgiler: başlara ortalı; solda baş varsa sola uzar.
+    final linePaint =
+        Paint()
+          ..color = drawColor
+          ..strokeWidth = _lineStrokeWidth;
+    final anyLeft = leftSide.any((left) => left);
+    final lineFrom = dx + (anyLeft ? -headW : 0) - headW * 0.35;
+    final lineTo = dx + headW * 1.35;
+    final bottomLineCount = ((bottomIndex - bottomLimitIndex) / 2).ceil();
+    final topLineCount = ((topIndex - topLimitIndex) / 2).floor();
+    for (var i = 0; i < bottomLineCount; i++) {
+      final y = _measureDescent + _noteSpaceHeight * 2 * (i + 5) + 1;
+      canvas.drawLine(Offset(lineFrom, y), Offset(lineTo, y), linePaint);
+    }
+    for (var i = 0; i > topLineCount; i--) {
+      final y = _measureDescent + _noteSpaceHeight * 2 * (i - 1);
+      canvas.drawLine(Offset(lineFrom, y), Offset(lineTo, y), linePaint);
+    }
+
+    if (value.dotted) {
+      _drawAugmentationDots(
+        canvas: canvas,
+        notes: sortedDescending,
+        dx: dx,
+        noteWidth: headW,
+        color: value.color,
+      );
+    }
+    return headW;
   }
 
   /// returns the width of the accidentals
@@ -338,6 +494,8 @@ class MusicNotationPainter extends CustomPainter {
     return width;
   }
 
+  /// Dik saplı nota veya sus çizer (ters saplılar [_drawStemDownChord] ile
+  /// parçalardan kurulur).
   double drawNote({
     required Canvas canvas,
     required Size size,
@@ -345,10 +503,7 @@ class MusicNotationPainter extends CustomPainter {
     required double dx,
     required int indexFromClefFirstSpace,
     bool isRest = false,
-    bool isHorizontalRotated = false,
     bool isVerticalRotated = false,
-    bool extraLine = false,
-    bool isOnLine = true,
     Color? color,
   }) {
     final notePainter = noteTextPainter(noteText, fontSize: _fontSize(size.height), color: color)
@@ -356,30 +511,13 @@ class MusicNotationPainter extends CustomPainter {
     final noteYOffset = isRest ? 0.0 : indexFromClefFirstSpace * _noteSpaceHeight;
     canvas.save();
     canvas.translate(dx, noteYOffset);
-    if (isHorizontalRotated) {
-      canvas.save();
-      // Geometri: ayna (rotY) içeriği [-w, 0]'a taşır; +0.915w öteleme glifi
-      // kendi yatay slotunda ([-0.085w, 0.915w]) tutar. İkili aralığın
-      // (second) başı aynalanmaz ve ana başların SOLUNA ofsetlenir
-      // (-0.915w → [-0.915w, 0.085w]). Eski 1.915w değeri notayı bir sonraki
-      // sembolün slotuna taşırıyordu.
-      canvas.translate(notePainter.width * (isVerticalRotated ? -0.915 : 0.915), 0);
-      canvas.translate(0, notePainter.height + (_noteSpaceHeight * 6));
-      canvas.transform(Matrix4.rotationX(pi).storage);
-      if (!isVerticalRotated) {
-        canvas.transform(Matrix4.rotationY(pi).storage);
-      }
-      notePainter.paint(canvas, Offset.zero);
-      canvas.restore();
-    } else {
-      if (isVerticalRotated) {
-        // Ayna uzayında -1.915w, ekranda ikinci notabaşını ana başların
-        // sağına koyar (dik akorda ikili aralık — doğru gravür konumu).
-        canvas.transform(Matrix4.rotationY(pi).storage);
-        canvas.translate(-notePainter.width * 1.915, 0);
-      }
-      notePainter.paint(canvas, Offset.zero);
+    if (isVerticalRotated) {
+      // Ayna uzayında -1.915w, ekranda ikinci notabaşını ana başların
+      // sağına koyar (dik akorda ikili aralık — doğru gravür konumu).
+      canvas.transform(Matrix4.rotationY(pi).storage);
+      canvas.translate(-notePainter.width * 1.915, 0);
     }
+    notePainter.paint(canvas, Offset.zero);
     canvas.restore();
     return notePainter.width;
   }
@@ -393,16 +531,16 @@ class MusicNotationPainter extends CustomPainter {
     required double noteWidth,
     Color? color,
   }) {
-    final paint = Paint()
-      ..color = color ?? this.color
-      ..style = PaintingStyle.fill;
+    final paint =
+        Paint()
+          ..color = color ?? this.color
+          ..style = PaintingStyle.fill;
     final radius = _noteSpaceHeight * 0.5;
     // Notabaşları her iki sap yönünde de ~[0, w] kutusunda (yeni geometri);
     // nokta tek kolonda, başların sağında durur.
     final dotX = dx + noteWidth * 1.25 + radius;
     final lineSpacing = (_measureExactHeight - _lineStrokeWidth + 1) / 4;
-    final firstSpaceCenterY =
-        _measureDescent + _lineStrokeWidth / 2 - 1 + lineSpacing * 3.5;
+    final firstSpaceCenterY = _measureDescent + _lineStrokeWidth / 2 - 1 + lineSpacing * 3.5;
     for (final note in notes) {
       var index = calculateNoteIndexDifferenceWithClefsFirstSpaceMidiNote(note);
       if (index.isOdd) index -= 1; // çizgideki nota → bir üst boşluk
@@ -411,14 +549,17 @@ class MusicNotationPainter extends CustomPainter {
     }
   }
 
+  /// Dik saplı notaların ek (ledger) çizgileri. Uzunluk, glif genişliğine
+  /// değil notabaşı genişliğine ([headWidth]) dayanır — bayraklı gliflerde
+  /// çizginin gereğinden uzun çıkmasını önler.
   void drawExtraLines({
     required Canvas canvas,
     required Size size,
     required MusicalValue note,
     required double dx,
     required String noteSymbol,
-    required bool isHorizontalRotated,
     required List<MidiNote> verticalRotatedNotes,
+    required double headWidth,
   }) {
     final notePainter = noteTextPainter(noteSymbol, fontSize: _fontSize(size.height))
       ..layout(maxWidth: size.width);
@@ -438,21 +579,17 @@ class MusicNotationPainter extends CustomPainter {
           ..color = color
           ..strokeWidth = _lineStrokeWidth;
 
-    // Ana notabaşları her iki sap yönünde de ~[0, w] kutusundadır
-    // (ters sapta [-0.085w, 0.915w]); ek çizgi başa ortalanır.
     double bottomY(int i) => _measureDescent + _noteSpaceHeight * 2 * (i + 5) + 1;
     double topY(int i) => _measureDescent + _noteSpaceHeight * 2 * (i - 1) + 1;
-    void line(double fromX, double toX, double y) => canvas.drawLine(
-          Offset(notePainter.width * fromX, y),
-          Offset(notePainter.width * toX, y),
-          paint,
-        );
+    void line(double fromX, double toX, double y) =>
+        canvas.drawLine(Offset(fromX, y), Offset(toX, y), paint);
 
+    // Ana başlar [0, headWidth] kutusunda; çizgi başa ortalanır.
     for (int i = 0; i < bottomLineCount; i++) {
-      line(-0.4, 1.4, bottomY(i));
+      line(-headWidth * 0.35, headWidth * 1.35, bottomY(i));
     }
     for (int i = 0; i > topLineCount; i--) {
-      line(-0.4, 1.4, topY(i));
+      line(-headWidth * 0.35, headWidth * 1.35, topY(i));
     }
 
     if (verticalRotatedNotes.isNotEmpty) {
@@ -465,15 +602,14 @@ class MusicNotationPainter extends CustomPainter {
       final bottomRotatedLineCount = ((rotatedLowestNoteSpace - bottomLimitIndex) / 2).ceil();
       final topRotatedLineCount = ((rotatedHighestNoteSpace - topLimitIndex) / 2).floor();
 
-      // İkili aralığın (second) başı: dik sapta ana başların sağında
-      // ([0.915w, 1.915w]), ters sapta solunda ([-0.915w, 0.085w]).
-      final fromX = isHorizontalRotated ? -1.3 : 0.5;
-      final toX = isHorizontalRotated ? 0.4 : 2.3;
+      // İkili aralığın (second) başı ana başların sağında; merkezi glif
+      // genişliğine bağlıdır (ayna + -1.915w ötelemesi).
+      final secondCenter = notePainter.width * 1.915 - headWidth / 2;
       for (int i = 0; i < bottomRotatedLineCount; i++) {
-        line(fromX, toX, bottomY(i));
+        line(secondCenter - headWidth * 0.85, secondCenter + headWidth * 0.85, bottomY(i));
       }
       for (int i = 0; i > topRotatedLineCount; i--) {
-        line(fromX, toX, topY(i));
+        line(secondCenter - headWidth * 0.85, secondCenter + headWidth * 0.85, topY(i));
       }
     }
     canvas.restore();
