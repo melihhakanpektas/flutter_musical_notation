@@ -1,13 +1,18 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_music_core/flutter_music_core.dart';
 import 'package:flutter_musical_notation/flutter_musical_notation.dart';
-import 'package:google_fonts/google_fonts.dart';
 
-void main() async {
-  WidgetsFlutterBinding.ensureInitialized();
-  await GoogleFonts.pendingFonts([GoogleFonts.notoMusic()]);
+void main() {
   runApp(const MainApp());
 }
+
+MusicalValue _note(int index, int octave, MusicalDuration duration,
+        {bool dotted = false}) =>
+    MusicalValue(
+      duration: duration,
+      dotted: dotted,
+      midiNotes: [MidiNote(index: index, octave: octave)],
+    );
 
 class MainApp extends StatelessWidget {
   const MainApp({super.key});
@@ -21,53 +26,68 @@ class MainApp extends StatelessWidget {
         body: Center(
           child: Padding(
             padding: const EdgeInsets.all(8.0),
-            child: MusicNotation(
-              beatUnit: MusicalDuration.quarter,
-              beatsPerMeasure: 4,
-              measureCount: 2,
-              color: Colors.white,
-              clef: Clef.treble,
-              values: [
-                MusicalValue(
-                  type: RhythmicType.note,
-                  duration: MusicalDuration.quarter,
-                  midiNotes: [MidiNote(index: 5, octave: 3)],
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                // Perdeli dizek: kirişli sekizlikler + tek değerler.
+                MusicNotation(
+                  color: Colors.white,
+                  measures: [
+                    NotationMeasure([
+                      Single(_note(0, 4, MusicalDuration.quarter)),
+                      Beam([
+                        _note(2, 4, MusicalDuration.eighth),
+                        _note(4, 4, MusicalDuration.eighth),
+                      ]),
+                      Beam([
+                        _note(5, 4, MusicalDuration.eighth),
+                        _note(4, 4, MusicalDuration.sixteenth),
+                        _note(2, 4, MusicalDuration.sixteenth),
+                      ]),
+                      Single(_note(0, 4, MusicalDuration.quarter)),
+                    ]),
+                    NotationMeasure([
+                      Beam([
+                        _note(5, 5, MusicalDuration.eighth),
+                        _note(4, 5, MusicalDuration.eighth),
+                        _note(2, 5, MusicalDuration.eighth),
+                        _note(0, 5, MusicalDuration.eighth),
+                      ]),
+                      Single(MusicalValue(
+                        duration: MusicalDuration.half,
+                        midiNotes: [MidiNote(index: 6, octave: 4)],
+                      )),
+                    ]),
+                  ],
                 ),
-                MusicalValue(
-                  type: RhythmicType.note,
-                  duration: MusicalDuration.quarter,
-                  midiNotes: [MidiNote(index: 6, octave: 3)],
-                ),
-                MusicalValue(
-                  type: RhythmicType.note,
-                  duration: MusicalDuration.quarter,
-                  midiNotes: [MidiNote(index: 1, octave: 3)],
-                ),
-                MusicalValue(
-                  type: RhythmicType.note,
-                  duration: MusicalDuration.quarter,
-                  midiNotes: [MidiNote(index: 2, octave: 3)],
-                ),
-
-                MusicalValue(
-                  type: RhythmicType.note,
-                  duration: MusicalDuration.quarter,
-                  midiNotes: [MidiNote(index: 3, octave: 6), MidiNote(index: 2, octave: 6)],
-                ),
-                MusicalValue(
-                  type: RhythmicType.note,
-                  duration: MusicalDuration.quarter,
-                  midiNotes: [MidiNote(index: 4, octave: 6)],
-                ),
-                MusicalValue(
-                  type: RhythmicType.note,
-                  duration: MusicalDuration.quarter,
-                  midiNotes: [MidiNote(index: 5, octave: 6)],
-                ),
-                MusicalValue(
-                  type: RhythmicType.note,
-                  duration: MusicalDuration.quarter,
-                  midiNotes: [MidiNote(index: 6, octave: 6), MidiNote(index: 5, octave: 6)],
+                const SizedBox(height: 24),
+                // Tek çizgili ritim dizeği: 5/8, 3+2 gruplama.
+                MusicNotation.rhythm(
+                  beatsPerMeasure: 5,
+                  beatUnit: MusicalDuration.eighth,
+                  color: Colors.white,
+                  height: 110,
+                  measures: [
+                    NotationMeasure([
+                      Beam([
+                        _note(0, 4, MusicalDuration.eighth),
+                        _note(0, 4, MusicalDuration.eighth),
+                        _note(0, 4, MusicalDuration.eighth),
+                      ]),
+                      Beam([
+                        _note(0, 4, MusicalDuration.eighth),
+                        _note(0, 4, MusicalDuration.eighth),
+                      ]),
+                    ]),
+                    NotationMeasure([
+                      Single(_note(0, 4, MusicalDuration.quarter)),
+                      Single(_note(0, 4, MusicalDuration.eighth)),
+                      Beam([
+                        _note(0, 4, MusicalDuration.eighth),
+                        _note(0, 4, MusicalDuration.eighth),
+                      ]),
+                    ]),
+                  ],
                 ),
               ],
             ),

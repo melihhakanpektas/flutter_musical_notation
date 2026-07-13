@@ -1,6 +1,6 @@
 name: flutter_musical_notation
 description: "A new Flutter package project."
-version: 0.0.2
+version: 0.3.0
 publish_to: "none"
 homepage:
 
@@ -24,11 +24,18 @@ dev_dependencies:
 
 # The following section is specific to Flutter packages.
 flutter:
-  # Nota sembolleri paketle birlikte gelir: sistem fontuna güvenmek
-  # platforma göre kırılıyordu (iOS'ta Noto Music yok; Android sürümleri
-  # arasında metrikler değişebilir). Noto Music, SIL OFL 1.1 lisanslıdır
-  # (fonts/OFL-NotoMusic.txt).
+  # Nota dizgisi SMuFL (Standard Music Font Layout) fontu Bravura ile yapılır.
+  # Bravura, konumlandırmayı fontun kendi metadata'sından (anchor noktaları,
+  # engraving defaults) alır; deneysel görsel kalibrasyona gerek kalmaz ve
+  # sonuç platformdan bağımsız tutarlıdır. Bravura SIL OFL 1.1 lisanslıdır
+  # (fonts/OFL-Bravura.txt). Metadata: fonts/bravura_metadata.json.
+  #
+  # NotoMusic (standart Unicode müzik blokları, SMuFL değil) geriye dönük
+  # uyumluluk için hâlâ paketleniyor (fonts/OFL-NotoMusic.txt).
   fonts:
+    - family: Bravura
+      fonts:
+        - asset: fonts/Bravura.otf
     - family: NotoMusic
       fonts:
         - asset: fonts/NotoMusic-Regular.ttf

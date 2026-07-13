@@ -1,698 +1,880 @@
-import 'dart:math';
-
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_music_core/flutter_music_core.dart';
-import 'package:flutter_musical_notation/src/measure.dart';
+import 'package:flutter_musical_notation/src/notation_measure.dart';
+import 'package:flutter_musical_notation/src/smufl.dart';
 
-/// NotoMusic TextStyle factory - uses native Flutter font
-TextStyle _notoMusicStyle(
-  double fontSize,
-  FontWeight fontWeight,
-  Color color,
-  double letterSpacing,
-) {
-  return TextStyle(
-    fontFamily: 'NotoMusic',
-    fontSize: fontSize,
-    fontWeight: fontWeight,
-    color: color,
-    letterSpacing: letterSpacing,
-  );
-}
-
+/// SMuFL (Bravura) tabanlı porte/nota çizici.
+///
+/// Koordinat sistemi **staff space** (sp) birimindedir: 1 sp = iki porte çizgisi
+/// arası = fontSize / 4. Bütün gliflerin (notabaşı, sap, bayrak, aksidan,
+/// anahtar, sus, rakam) konumu fontun kendi metadata'sından ([Smufl]) gelir.
+///
+/// Dikey konumlandırma diatonik "porte konumu" üzerinden yürür: [_staffIndex],
+/// anahtarın ilk boşluğundaki notaya göre kaç diatonik adım (yarım boşluk)
+/// uzakta olduğunu verir (aşağı = artı). Bu, tüm anahtarlar için tek formülle
+/// çalışır çünkü [Clef.firstSpaceMidiNote] her zaman alttan ilk boşluğu gösterir.
+///
+/// İçerik [NotationMeasure] listesiyle ölçü ölçü verilir; kiriş (beam)
+/// gruplaması çağıranın kararıdır ([Beam]). [rhythmStaff] true ise tek çizgili
+/// ritim dizeği çizilir: bütün notabaşları çizginin üzerine oturur, saplar
+/// yukarı bakar, anahtar olarak perküsyon anahtarı kullanılır.
 class MusicNotationPainter extends CustomPainter {
   final int beatsPerMeasure;
   final MusicalDuration beatUnit;
-  final int measureCount;
   final Color color;
   final Clef clef;
+  final KeySignature keySignature;
   final bool isEnd;
   final bool horizontallyCenterNotes;
   final bool drawClef;
   final bool drawTimeSignature;
-  final List<MusicalValue> values;
+  final bool rhythmStaff;
+  final List<NotationMeasure> measures;
 
   MusicNotationPainter({
     this.beatsPerMeasure = 4,
     this.beatUnit = MusicalDuration.quarter,
-    this.measureCount = 1,
     this.color = Colors.black,
     this.clef = Clef.treble,
+    this.keySignature = KeySignature.none,
     this.isEnd = true,
     this.horizontallyCenterNotes = false,
     this.drawClef = true,
     this.drawTimeSignature = true,
-    this.values = const [],
+    this.rhythmStaff = false,
+    this.measures = const [],
   });
 
-  double _fontSize(double height) => height / 3;
+  // Çizim boyunca sabit geometri (paint başında hesaplanır).
+  late double _sp; // staff space (px)
+  late double _fontSize; // 4 * sp
+  late double _centerY; // orta porte çizgisi (3. çizgi)
 
-  late TextPainter _measurePainter;
-  late TextPainter _measureLinePainter;
-  late TextPainter _clefPainter;
-  late TextPainter _beatsPerMeasurePainter;
-  late TextPainter _beatUnitPainter;
-  late TextPainter _endPainter;
-  late double _noteSpaceHeight;
-  late double _measureDescent;
-  late double _measureExactHeight;
-  late double _lineStrokeWidth;
+  /// Bağ (tie) için son çizilen nota olayının tutturma bilgisi: notabaşı
+  /// konumları (porte konumu + sol/sağ kenar x) — paint başında sıfırlanır,
+  /// sus görülünce temizlenir. Bağlar ölçü ve kiriş sınırlarını doğal olarak
+  /// aşabilir (senkop yazımının gereği).
+  ({List<({int index, double xLeft, double xRight})> heads})? _tiePrev;
 
-  final bottomLimitIndex = 2;
-  final topLimitIndex = -8;
+  // Porte çizgileri odd staff-index'te (üst -7 … alt +1), boşluklar even'de.
+  static const int _topLineIndex = -7;
+  static const int _bottomLineIndex = 1;
 
-  void _initializeDrawingElements(Canvas canvas, Size size) {
-    final fontSize = _fontSize(size.height);
-    _measurePainter = noteTextPainter(Measure.measureSpace.symbol, fontSize: fontSize)
-      ..layout(maxWidth: size.width);
-    _measureDescent = _measurePainter.computeLineMetrics().first.descent;
-    _measureExactHeight = _measurePainter.computeLineMetrics().first.baseline - _measureDescent;
-    _noteSpaceHeight = _measurePainter.height * 0.0675;
-    _measureLinePainter = noteTextPainter(Measure.measureLine.symbol, fontSize: fontSize)
-      ..layout(maxWidth: size.width);
-    _clefPainter = noteTextPainter(clef.symbol, fontSize: fontSize)..layout(maxWidth: size.width);
-    _beatsPerMeasurePainter = noteTextPainter(beatsPerMeasure.toString(), fontSize: fontSize * 0.7)
-      ..layout(maxWidth: size.width);
-    _beatUnitPainter = noteTextPainter(beatUnit.value.toString(), fontSize: fontSize * 0.7)
-      ..layout(maxWidth: size.width);
-    _endPainter = noteTextPainter(Measure.measureEnd.symbol, fontSize: fontSize)
-      ..layout(maxWidth: size.width);
+  /// Orta çizginin porte konumu (tek çizgili dizekte notaların oturduğu yer).
+  static const int _midLineIndex = -3;
 
-    _lineStrokeWidth = size.height / 100;
+  // ---------------------------------------------------------------------------
+  // Geometri yardımcıları
+  // ---------------------------------------------------------------------------
+
+  /// Notanın diatonik porte konumu (anahtarın ilk boşluğuna göre; aşağı = +).
+  /// Ritim dizeğinde perde yoksayılır: her nota çizginin üzerindedir.
+  int _staffIndex(MidiNote note) =>
+      rhythmStaff
+          ? _midLineIndex
+          : clef.firstSpaceMidiNote.expandedIndex - note.expandedIndex;
+
+  /// Porte konumunun (yarım boşluk indeksi) piksel y'si. Orta çizgi index -3.
+  double _yForIndex(int index) => _centerY + (index + 3) * (_sp / 2);
+
+  /// Anchor'ı (staff space, +y yukarı) glif origin'ine göre canvas noktasına
+  /// çevirir.
+  Offset _anchor(double originX, double originY, SpPoint a) =>
+      Offset(originX + a.x * _sp, originY - a.yUp * _sp);
+
+  TextPainter _painter(String glyph, {Color? color, double sizeSp = 4}) {
+    return TextPainter(
+      text: TextSpan(
+        text: glyph,
+        style: TextStyle(
+          fontFamily: Smufl.fontFamily,
+          fontSize: _sp * sizeSp,
+          color: color ?? this.color,
+        ),
+      ),
+      textDirection: TextDirection.ltr,
+    )..layout();
   }
 
-  void centerCanvasVertical(Canvas canvas, Size size) {
-    final yOffset = size.height / 2 - (_measurePainter.height / 2);
-    canvas.translate(0, yOffset);
+  /// Glifi, SMuFL origin'i (baseline üzerinde, advance başlangıcı) canvas
+  /// [originX],[originY] noktasına gelecek şekilde çizer ve advance genişliğini
+  /// (px) döndürür. TextPainter kutunun sol-üstünü verilen noktaya koyar;
+  /// baseline'ı kutu tepesinden [baseline] kadar aşağıdadır, bu yüzden y'yi
+  /// origin baseline'a hizalamak için geri çekeriz.
+  double _drawGlyph(
+    Canvas canvas,
+    String glyph,
+    double originX,
+    double originY, {
+    Color? color,
+    double sizeSp = 4,
+  }) {
+    final tp = _painter(glyph, color: color, sizeSp: sizeSp);
+    final baseline = tp.computeDistanceToActualBaseline(TextBaseline.alphabetic);
+    tp.paint(canvas, Offset(originX, originY - baseline));
+    return tp.width;
   }
 
-  void drawStaff(Canvas canvas, Size size) {
-    final lineSpacing =
-        (_measureExactHeight - _lineStrokeWidth + 1) / 4; // Distance between staff lines
+  double _glyphWidth(String glyph, {double sizeSp = 4}) =>
+      _painter(glyph, sizeSp: sizeSp).width;
+
+  Paint _fill(Color c) =>
+      Paint()
+        ..color = c
+        ..style = PaintingStyle.fill;
+
+  // ---------------------------------------------------------------------------
+  // paint
+  // ---------------------------------------------------------------------------
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    _fontSize = size.height / 3;
+    _sp = _fontSize / 4;
+    _centerY = size.height / 2;
+    _tiePrev = null;
+
+    _drawStaffLines(canvas, size);
+
+    double x = _sp; // sol kenar boşluğu
+
+    if (drawClef) {
+      x += _drawClef(canvas, x) + _sp;
+    }
+    final keyW = _drawKeySignature(canvas, x);
+    if (keyW > 0) x += keyW + _sp;
+    if (drawTimeSignature) {
+      x += _drawTimeSignature(canvas, x) + _sp;
+    }
+
+    final endThickness =
+        (isEnd ? Smufl.thickBarlineThickness : Smufl.thinBarlineThickness) * _sp;
+    final regionLeft = x;
+    final regionRight = size.width - endThickness - _sp * 0.25;
+    final measureCount = measures.isEmpty ? 1 : measures.length;
+    final measureWidth = (regionRight - regionLeft) / measureCount;
+
+    _drawBarlines(canvas, regionLeft, measureWidth, measureCount);
+    _drawNotes(canvas, regionLeft, measureWidth);
+  }
+
+  void _drawStaffLines(Canvas canvas, Size size) {
     final paint =
         Paint()
           ..color = color
-          ..strokeWidth = _lineStrokeWidth;
-
-    // Draw 5 horizontal lines for the staff
-    for (int i = 0; i < 5; i++) {
-      final y = i * lineSpacing + _measureDescent + _lineStrokeWidth / 2 - 1;
+          ..strokeWidth = Smufl.staffLineThickness * _sp;
+    final lineCount = rhythmStaff ? 1 : 5;
+    for (int k = 0; k < lineCount; k++) {
+      final y = _centerY + (k - (lineCount - 1) / 2) * _sp;
       canvas.drawLine(Offset(0, y), Offset(size.width, y), paint);
     }
   }
 
-  double clefEndX = 0.0;
-
-  void _drawClef(Canvas canvas, Size size) {
-    canvas.save();
-    var dx = _measureLinePainter.width * 2;
-    var dy = (_measureLinePainter.height * .06) * clef.offsetYMultiplier;
-    canvas.translate(dx, dy);
-    _clefPainter.paint(canvas, Offset.zero);
-    canvas.restore();
-    clefEndX = _clefPainter.width + dx;
+  double _drawClef(Canvas canvas, double x) {
+    if (rhythmStaff) {
+      // Perküsyon anahtarı dikeyde origin'e ortalıdır; çizgiye oturtulur.
+      return _drawGlyph(canvas, Smufl.ch(Smufl.percussionClef), x, _centerY);
+    }
+    final c = Smufl.clef(clef);
+    final refIndex = _staffIndex(c.refNote);
+    return _drawGlyph(canvas, c.glyph, x, _yForIndex(refIndex));
   }
 
-  double timeSignatureEndX = 0.0;
+  /// Donanımı (anahtar sonrası diyez/bemol dizisi) çizer; kapladığı
+  /// genişliği döndürür (donanımsızsa ve ritim dizeğinde 0).
+  ///
+  /// Konumlar klefe göre standart banttan hesaplanır: ilk aksidanın (diyezde
+  /// Fa, bemolde Si) porte konumu klefin bandına oturtulur, sonrakiler sabit
+  /// zikzak adımlarıyla (diyez +3/-4, bemol -3/+4) yerleşir. Sol/Fa/Do (alto)
+  /// anahtarlarında standart gravürle birebir; tenor anahtarının diyez
+  /// istisnası (Fa♯'ın alta alınması) uygulanmaz.
+  double _drawKeySignature(Canvas canvas, double x) {
+    final fifths = keySignature.fifths;
+    if (rhythmStaff || fifths == 0) return 0;
 
-  void _drawTimeSignature(Canvas canvas, Size size) {
-    canvas.save();
-    var dx = clefEndX + _measureLinePainter.width * 2;
-    var dy = _measurePainter.height / 8;
-    canvas.translate(dx, dy);
-    var beatsPerMeasureXOffset = 0.0;
-    var beatUnitXOffset = 0.0;
-    if (beatsPerMeasure.toString().length > beatUnit.value.toString().length) {
-      beatUnitXOffset = (_beatsPerMeasurePainter.width / 2) - (_beatUnitPainter.width / 2);
-    } else {
-      beatsPerMeasureXOffset = (_beatUnitPainter.width / 2) - (_beatsPerMeasurePainter.width / 2);
-    }
-
-    _beatsPerMeasurePainter.paint(
-      canvas,
-      Offset(beatsPerMeasureXOffset, -_measurePainter.height * .15),
+    final sharps = fifths > 0;
+    final glyph = Smufl.accidental(
+      sharps ? MusicalAccidental.sharp : MusicalAccidental.flat,
     );
-    _beatUnitPainter.paint(canvas, Offset(beatUnitXOffset, _measurePainter.height * .15));
-    canvas.restore();
 
-    timeSignatureEndX = max(_beatsPerMeasurePainter.width, _beatUnitPainter.width) + dx;
-  }
-
-  late double widthOfAMeasure;
-
-  void drawMeasures(Canvas canvas, Size size) {
-    final staffWidthExceptLines =
-        (size.width - timeSignatureEndX - (isEnd ? _endPainter.width : _measureLinePainter.width));
-    // Draw measures
-    widthOfAMeasure = staffWidthExceptLines / measureCount;
-
-    canvas.save();
-    for (var i = 0; i < measureCount + 1; i++) {
-      canvas.save();
-      if (i == measureCount) {
-        if (isEnd) {
-          canvas.translate(size.width - _endPainter.width - timeSignatureEndX, 0);
-          _endPainter.paint(canvas, Offset.zero);
-        } else {
-          canvas.translate(widthOfAMeasure * i - timeSignatureEndX, 0);
-          _measureLinePainter.paint(canvas, Offset.zero);
-        }
-      } else {
-        canvas.translate(widthOfAMeasure * i, 0);
-        _measureLinePainter.paint(canvas, Offset.zero);
-      }
-      canvas.restore();
-      if (i == 0) {
-        canvas.translate(timeSignatureEndX, 0);
+    // İlk aksidanın oktavı: porte konumu klefin standart bandına düşen tek
+    // oktav seçilir (bant 7 konum genişliğinde olduğundan tektir).
+    final letter = sharps ? 3 : 6; // Fa : Si
+    final lo = sharps ? -11 : -4;
+    final hi = sharps ? -5 : 0;
+    int? index;
+    for (var octave = 0; octave <= 9; octave++) {
+      final candidate =
+          clef.firstSpaceMidiNote.expandedIndex - (letter + 7 * octave);
+      if (candidate >= lo && candidate <= hi) {
+        index = candidate;
+        break;
       }
     }
-    canvas.restore();
+    assert(index != null, 'Donanım bandı bulunamadı: $clef');
+
+    const sharpSteps = [3, -4, 3, 3, -4, 3];
+    const flatSteps = [-3, 4, -3, 4, -3, 4];
+    final steps = sharps ? sharpSteps : flatSteps;
+
+    var dx = x;
+    var currentIndex = index!;
+    for (var i = 0; i < fifths.abs(); i++) {
+      if (i > 0) currentIndex += steps[i - 1];
+      dx += _drawGlyph(canvas, glyph, dx, _yForIndex(currentIndex));
+    }
+    return dx - x;
   }
 
-  void drawNotes(Canvas canvas, Size size) {
+  /// İki basamaklı ölçü imini üst üste çizer; kapladığı genişliği döndürür.
+  double _drawTimeSignature(Canvas canvas, double x) {
+    final num = beatsPerMeasure.toString();
+    final den = beatUnit.value.toString();
+
+    double widthOf(String s) => s
+        .split('')
+        .map((d) => _glyphWidth(Smufl.digit(int.parse(d))))
+        .fold(0.0, (a, b) => a + b);
+
+    final numW = widthOf(num);
+    final denW = widthOf(den);
+    final totalW = numW > denW ? numW : denW;
+
+    void drawRow(String s, double rowW, double centerYRow) {
+      var dx = x + (totalW - rowW) / 2;
+      for (final ch in s.split('')) {
+        dx += _drawGlyph(canvas, Smufl.digit(int.parse(ch)), dx, centerYRow);
+      }
+    }
+
+    // Pay orta çizginin 1 sp üstünde, payda 1 sp altında ortalanır.
+    drawRow(num, numW, _centerY - _sp);
+    drawRow(den, denW, _centerY + _sp);
+    return totalW;
+  }
+
+  void _drawBarlines(
+    Canvas canvas,
+    double regionLeft,
+    double measureWidth,
+    int measureCount,
+  ) {
+    // Tek çizgili dizekte de barlar standart porte yüksekliğinde (4 sp) çizilir.
+    final topY = _centerY - 2 * _sp;
+    final bottomY = _centerY + 2 * _sp;
+    for (int i = 1; i <= measureCount; i++) {
+      final boundaryX = regionLeft + i * measureWidth;
+      final isFinal = i == measureCount && isEnd;
+      final thickness =
+          (isFinal ? Smufl.thickBarlineThickness : Smufl.thinBarlineThickness) *
+          _sp;
+      canvas.drawRect(
+        Rect.fromLTRB(boundaryX - thickness, topY, boundaryX, bottomY),
+        _fill(color),
+      );
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Notalar
+  // ---------------------------------------------------------------------------
+
+  void _drawNotes(Canvas canvas, double regionLeft, double measureWidth) {
     final measureTimeLength = beatsPerMeasure * (1 / beatUnit.value);
 
-    var currentNoteIndex = 0;
+    for (var m = 0; m < measures.length; m++) {
+      final measure = measures[m];
+      assert(
+        measure.timeLength <= measureTimeLength + 1e-9,
+        'Ölçü ${m + 1} taşıyor: ${measure.timeLength} > $measureTimeLength '
+        '($beatsPerMeasure/${beatUnit.value})',
+      );
+      final innerLeft = regionLeft + m * measureWidth + measureWidth * 0.06;
+      final innerWidth = measureWidth * 0.88;
 
-    // Boyutla orantılı: 150 px yükseklikte eski sabit (-37.5) ile birebir,
-    // diğer boyutlarda da doğru ölçeklenir.
-    final measureStartPadding =
-        (horizontallyCenterNotes ? -_fontSize(size.height) * 0.75 : widthOfAMeasure * 0.1);
-
-    final staffWidthExceptLines =
-        (size.width - timeSignatureEndX - (isEnd ? _endPainter.width : _measureLinePainter.width));
-    // Draw measures
-    widthOfAMeasure = staffWidthExceptLines / measureCount - measureStartPadding;
-
-    canvas.translate(timeSignatureEndX, 0);
-    for (var i = 0; i < measureCount; i++) {
-      var notesInMeasureList = <MusicalValue>[];
-      var currentBeat = 0.0;
-
-      // Get all notes in the measure
-      while (currentBeat < measureTimeLength && currentNoteIndex < values.length) {
-        final currentNote = values[currentNoteIndex];
-        currentBeat += currentNote.timeLength;
-        notesInMeasureList.add(currentNote);
-        currentNoteIndex++;
+      double originXAt(double cursorTime, MusicalValue value) {
+        final slotX =
+            innerLeft + (cursorTime / measureTimeLength) * innerWidth;
+        if (!horizontallyCenterNotes) return slotX;
+        final slotW = (value.timeLength / measureTimeLength) * innerWidth;
+        final headW = Smufl.noteheadWidthOf(value.duration) * _sp;
+        return slotX + slotW / 2 - headW / 2;
       }
 
-      canvas.translate(measureStartPadding, 0);
-
-      // Draw notes in the measure
-      for (var note in notesInMeasureList) {
-        final timeLengthRatioOfNoteInMeasure = note.timeLength / measureTimeLength;
-        final widthOfNote = widthOfAMeasure * timeLengthRatioOfNoteInMeasure;
-        drawChord(canvas, size, note, horizontallyCenterNotes ? widthOfNote / 2 : 0);
-        canvas.translate(widthOfNote, 0);
+      var cursorTime = 0.0;
+      for (final element in measure.elements) {
+        switch (element) {
+          case Single(:final value):
+            _drawValue(canvas, value, originXAt(cursorTime, value));
+            cursorTime += value.timeLength;
+          case Beam(:final values):
+            final origins = <double>[];
+            for (final v in values) {
+              origins.add(originXAt(cursorTime, v));
+              cursorTime += v.timeLength;
+            }
+            _drawBeamGroup(canvas, values, origins);
+        }
       }
     }
   }
 
-  double drawChord(Canvas canvas, Size size, MusicalValue musicalValue, double startDx) {
-    // Calculates the average note position to determine if the chord should be rotated horizontally
-    final isRest = musicalValue.type == RhythmicType.rest;
-    final isHorizontalRotated =
-        musicalValue.duration != MusicalDuration.whole &&
-        !isRest &&
-        (musicalValue.midiNotes.map((e) => e.octave * 7 + e.index).reduce((a, b) => a + b) /
-                musicalValue.midiNotes.length) >
-            (clef.firstSpaceMidiNote.octave * 7 + clef.firstSpaceMidiNote.index + 3);
+  // ---- Ortak değer yerleşimi -------------------------------------------------
 
-    // Reorder notes according to its horizontal rotation
-    final sortedNoteList =
-        musicalValue.midiNotes.toList()..sort(
-          (a, b) =>
-              isHorizontalRotated
-                  ? b.midiNumberWithoutAccidental.compareTo(a.midiNumber)
-                  : a.midiNumberWithoutAccidental.compareTo(b.midiNumber),
-        );
+  /// Değerin notalarını perdeye göre artan sıralar ve porte konumlarını verir.
+  ({List<MidiNote> notes, List<int> indices}) _layoutIndices(
+    MusicalValue value,
+  ) {
+    final notes = value.midiNotes.toList()
+      ..sort((a, b) => a.expandedIndex.compareTo(b.expandedIndex));
+    return (notes: notes, indices: notes.map(_staffIndex).toList());
+  }
 
-    final accidentalsWidth = drawAccidentals(
-      sortedNoteList,
-      canvas,
-      size,
-      startDx,
-      color: musicalValue.color,
-    );
-    var noteWidth = 0.0;
+  /// İkili aralık (second) yer değiştirmesi: sap yönünde okuyarak, bir önceki
+  /// yerleştirilmemiş notaya bir diatonik adım bitişik olan nota sapın öbür
+  /// yanına kayar (dik sapta sağa, ters sapta sola). Her notabaşının x origin'i
+  /// döner.
+  List<double> _headOrigins(List<int> indices, bool stemUp, double originX) {
+    final dispOffset = (Smufl.noteheadWidth - Smufl.stemThickness) * _sp;
+    final order = List<int>.generate(indices.length, (i) => i);
+    final readOrder = stemUp ? order : order.reversed.toList();
 
-    var isPreviousRotatedVertical = false;
-    final verticalRotatedNotes = <MidiNote>[];
-
-    final noteSymbol = musicalValue.duration.symbol(musicalValue.type);
-    final headWidth = _headWidthFor(size, musicalValue.duration);
-
-    if (!isRest && musicalValue.midiNotes.isNotEmpty && isHorizontalRotated) {
-      // Ters saplı notalar parçalardan kurulur: doğru eğimli notabaşı +
-      // tek ortak sap + doğru kıvrımlı bayrak (glif döndürme yönteminin
-      // ayna-bayrak / çift-sap / kopuk-sap kusurlarını giderir).
-      noteWidth = _drawStemDownChord(
-        canvas: canvas,
-        size: size,
-        value: musicalValue,
-        sortedDescending: sortedNoteList,
-        dx: accidentalsWidth + startDx,
-      );
-    } else if (!isRest && musicalValue.midiNotes.isNotEmpty) {
-      for (var i = 0; i < sortedNoteList.length; i++) {
-        final note = sortedNoteList[i];
-        final noteIndexDifference = calculateNoteIndexDifferenceWithClefsFirstSpaceMidiNote(note);
-        bool isVerticalRotated = false;
-        if (i != 0 &&
-            !isPreviousRotatedVertical &&
-            calculateIndexDifferenceBetweenFirstNoteToSecondNote(sortedNoteList[i - 1], note) ==
-                -1) {
-          verticalRotatedNotes.add(note);
-          isVerticalRotated = true;
-          isPreviousRotatedVertical = true;
-        } else {
-          isPreviousRotatedVertical = false;
-        }
-        drawNote(
-          canvas: canvas,
-          size: size,
-          noteText: noteSymbol,
-          dx: accidentalsWidth + startDx,
-          isRest: isRest,
-          indexFromClefFirstSpace: noteIndexDifference,
-          isVerticalRotated: isVerticalRotated,
-          color: musicalValue.color,
-        );
+    final noteX = List<double>.filled(indices.length, originX);
+    bool prevDisplaced = false;
+    int? prevIndex;
+    for (final i in readOrder) {
+      var displaced = false;
+      if (prevIndex != null &&
+          (indices[i] - prevIndex).abs() == 1 &&
+          !prevDisplaced) {
+        displaced = true;
       }
-      noteWidth = headWidth;
-      drawExtraLines(
-        canvas: canvas,
-        size: size,
-        note: musicalValue,
-        dx: accidentalsWidth + startDx,
-        noteSymbol: noteSymbol,
-        verticalRotatedNotes: verticalRotatedNotes,
-        headWidth: headWidth,
+      prevDisplaced = displaced;
+      prevIndex = indices[i];
+      if (displaced) {
+        noteX[i] = stemUp ? originX + dispOffset : originX - dispOffset;
+      }
+    }
+    return noteX;
+  }
+
+  /// Notabaşları + aksidanlar + ek çizgiler + uzatma noktaları — sap yönünden
+  /// bağımsız ortak kısım. Çizilen başların (porte konumu, x) listesini
+  /// döndürür (bağ tutturması için).
+  List<({int index, double x})> _drawHeads({
+    required Canvas canvas,
+    required MusicalValue value,
+    required List<MidiNote> notes,
+    required List<int> indices,
+    required List<double> noteX,
+    required Color drawColor,
+  }) {
+    final headGlyph = Smufl.notehead(value.duration);
+    final headW = Smufl.noteheadWidthOf(value.duration) * _sp;
+
+    final blockLeft = noteX.reduce((a, b) => a < b ? a : b);
+    _drawAccidentals(canvas, notes, indices, blockLeft, drawColor);
+
+    for (var i = 0; i < notes.length; i++) {
+      _drawGlyph(
+        canvas,
+        headGlyph,
+        noteX[i],
+        _yForIndex(indices[i]),
+        color: drawColor,
       );
-      if (musicalValue.dotted) {
-        _drawAugmentationDots(
-          canvas: canvas,
-          notes: sortedNoteList,
-          dx: accidentalsWidth + startDx,
-          noteWidth: headWidth,
-          color: musicalValue.color,
-        );
+    }
+
+    final heads = [
+      for (var i = 0; i < notes.length; i++) (index: indices[i], x: noteX[i]),
+    ];
+    _drawLedgerLines(canvas, heads, headW, drawColor);
+    if (value.dotted) {
+      _drawAugmentationDots(canvas, heads, headW, drawColor);
+    }
+    return heads;
+  }
+
+  // ---- Bağ (tie) ---------------------------------------------------------------
+
+  /// Gerekliyse önceki nota olayından bu olaya bağ çizer ve olayı bir sonraki
+  /// bağ için kaydeder. Bağ, aynı porte konumundaki baş çiftleri arasına,
+  /// notabaşı tarafına (sap yönünün tersine) çizilir.
+  void _handleTie({
+    required Canvas canvas,
+    required MusicalValue value,
+    required List<({int index, double x})> heads,
+    required double headW,
+    required bool tieAbove,
+    required Color drawColor,
+  }) {
+    if (value.tiedToPrevious) {
+      final prev = _tiePrev;
+      assert(
+        prev != null,
+        'tiedToPrevious: önceki nota yok (ilk değer ya da sus sonrası).',
+      );
+      if (prev != null) {
+        var drawn = false;
+        for (final h in heads) {
+          // Aynı porte konumundaki önceki başlardan en sağdakine bağlan.
+          double? fromX;
+          for (final p in prev.heads) {
+            if (p.index == h.index && (fromX == null || p.xRight > fromX)) {
+              fromX = p.xRight;
+            }
+          }
+          if (fromX == null) continue;
+          drawn = true;
+          _drawTie(
+            canvas: canvas,
+            x0: fromX,
+            x1: h.x,
+            index: h.index,
+            above: tieAbove,
+            color: drawColor,
+          );
+        }
+        assert(drawn, 'tiedToPrevious: aynı perdede önceki baş bulunamadı.');
+      }
+    }
+    _tiePrev = (
+      heads: [
+        for (final h in heads) (index: h.index, xLeft: h.x, xRight: h.x + headW),
+      ],
+    );
+  }
+
+  /// Bağ eğrisi: uçları ince, ortası `tieMidpointThickness` kalınlığında
+  /// mercek biçimli dolgu (iki kübik Bézier). Eğri yüksekliği bağ uzunluğuyla
+  /// orantılı, 0.4–1.0 sp aralığına sıkıştırılır.
+  void _drawTie({
+    required Canvas canvas,
+    required double x0,
+    required double x1,
+    required int index,
+    required bool above,
+    required Color color,
+  }) {
+    final dir = above ? -1.0 : 1.0;
+    final gap = 0.1 * _sp;
+    var sx = x0 + gap;
+    var ex = x1 - gap;
+    if (ex - sx < 0.5 * _sp) {
+      // Çok kısa bağlarda boşluk bırakma; uçları başlara değdir.
+      sx = x0;
+      ex = x1;
+    }
+    final y = _yForIndex(index) + dir * 0.6 * _sp;
+    final w = ex - sx;
+    var arcH = w * 0.15;
+    if (arcH < 0.4 * _sp) arcH = 0.4 * _sp;
+    if (arcH > 1.0 * _sp) arcH = 1.0 * _sp;
+    final h = dir * arcH;
+    // Kontrol ofset farkı d: orta kalınlık ≈ 1.5·d → d = kalınlık / 1.5.
+    final d = dir * (Smufl.tieMidpointThickness / 1.5) * _sp;
+
+    final path =
+        Path()
+          ..moveTo(sx, y)
+          ..cubicTo(sx + w / 3, y + h + d, ex - w / 3, y + h + d, ex, y)
+          ..cubicTo(ex - w / 3, y + h - d, sx + w / 3, y + h - d, sx, y)
+          ..close();
+    canvas.drawPath(path, _fill(color));
+  }
+
+  // ---- Tek değer (kirişsiz) ---------------------------------------------------
+
+  void _drawValue(Canvas canvas, MusicalValue value, double originX) {
+    final drawColor = value.color ?? color;
+
+    if (value.type == RhythmicType.rest) {
+      _drawRest(canvas, value.duration, originX, drawColor);
+      return;
+    }
+
+    final duration = value.duration;
+    final layout = _layoutIndices(value);
+    final indices = layout.indices;
+
+    // Sap yönü: ortalama porte konumu orta çizginin (index -3) üstünde ise
+    // (yani daha tiz) ters sap. Birlik notada sap yoktur; ritim dizeğinde
+    // notalar çizgide (index -3) olduğundan sap hep yukarı bakar.
+    final avgIndex = indices.reduce((a, b) => a + b) / indices.length;
+    final stemDown = duration != MusicalDuration.whole && avgIndex < -3;
+    final stemUp = !stemDown;
+
+    final noteX = _headOrigins(indices, stemUp, originX);
+    final heads = _drawHeads(
+      canvas: canvas,
+      value: value,
+      notes: layout.notes,
+      indices: indices,
+      noteX: noteX,
+      drawColor: drawColor,
+    );
+    _handleTie(
+      canvas: canvas,
+      value: value,
+      heads: heads,
+      headW: Smufl.noteheadWidthOf(duration) * _sp,
+      // Notabaşı tarafı: sapın (birlikte "olası" sapın) tersi — süreden
+      // bağımsız olarak konuma bakılır.
+      tieAbove: avgIndex < -3,
+      drawColor: drawColor,
+    );
+
+    if (duration != MusicalDuration.whole) {
+      _drawStemAndFlag(
+        canvas: canvas,
+        duration: duration,
+        originX: originX,
+        indices: indices,
+        stemUp: stemUp,
+        color: drawColor,
+      );
+    }
+  }
+
+  void _drawRest(
+    Canvas canvas,
+    MusicalDuration duration,
+    double originX,
+    Color color,
+  ) {
+    _tiePrev = null; // sus, bağ zincirini keser
+    // Sus dikey kaydı: birlik sus bir çizgiden sarkar (5 çizgide 4. çizgi,
+    // tek çizgide çizginin kendisi), diğerleri orta çizgiye oturur.
+    final originY = switch (duration) {
+      MusicalDuration.whole => rhythmStaff ? _centerY : _centerY - _sp,
+      _ => _centerY,
+    };
+    _drawGlyph(canvas, Smufl.rest(duration), originX, originY, color: color);
+  }
+
+  void _drawStemAndFlag({
+    required Canvas canvas,
+    required MusicalDuration duration,
+    required double originX,
+    required List<int> indices,
+    required bool stemUp,
+    required Color color,
+  }) {
+    final minIndex = indices.reduce((a, b) => a < b ? a : b); // en tiz (üst)
+    final maxIndex = indices.reduce((a, b) => a > b ? a : b); // en pes (alt)
+    final topY = _yForIndex(minIndex);
+    final bottomY = _yForIndex(maxIndex);
+    final stemLen = Smufl.stemLength * _sp;
+    final stemThk = Smufl.stemThickness * _sp;
+    final flag = Smufl.flag(duration);
+
+    if (stemUp) {
+      // Sap, en pes notabaşının sağ tutturma noktasından (stemUpSE) en tiz
+      // notabaşının 3.5 sp üstüne uzanır.
+      final attachBottom = _anchor(originX, bottomY, Smufl.stemUpSE);
+      final stemRightX = attachBottom.dx;
+      final stemTopY = topY - stemLen;
+      canvas.drawRect(
+        Rect.fromLTRB(stemRightX - stemThk, stemTopY, stemRightX, attachBottom.dy),
+        _fill(color),
+      );
+      if (flag != null) {
+        // Bayrağın stemUpNW anchor'ı sap tepesine (sol kenar) oturur.
+        final flagOriginX = stemRightX - stemThk - flag.upAnchor.x * _sp;
+        final flagOriginY = stemTopY + flag.upAnchor.yUp * _sp;
+        _drawGlyph(canvas, flag.up, flagOriginX, flagOriginY, color: color);
       }
     } else {
-      noteWidth = drawNote(
-        canvas: canvas,
-        size: size,
-        noteText: noteSymbol,
-        dx: startDx,
-        isRest: isRest,
-        indexFromClefFirstSpace: 0,
-        color: musicalValue.color,
+      // Ters sap: en tiz notabaşının sol tutturma noktasından (stemDownNW) en
+      // pes notabaşının 3.5 sp altına.
+      final attachTop = _anchor(originX, topY, Smufl.stemDownNW);
+      final stemLeftX = attachTop.dx;
+      final stemBottomY = bottomY + stemLen;
+      canvas.drawRect(
+        Rect.fromLTRB(stemLeftX, attachTop.dy, stemLeftX + stemThk, stemBottomY),
+        _fill(color),
       );
+      if (flag != null) {
+        // Bayrağın stemDownSW anchor'ı sap dibine (sol kenar) oturur.
+        final flagOriginX = stemLeftX - flag.downAnchor.x * _sp;
+        final flagOriginY = stemBottomY + flag.downAnchor.yUp * _sp;
+        _drawGlyph(canvas, flag.down, flagOriginX, flagOriginY, color: color);
+      }
     }
-    return noteWidth + accidentalsWidth;
   }
 
-  /// Süreye uygun notabaşı genişliği — ek çizgi ve nokta konumlandırmasının
-  /// ortak ölçüsü. Birlik notanın başı siyah baştan geniştir; ölçü süreye
-  /// göre seçilmezse ledger çizgisi başa ortalanmaz.
-  double _headWidthFor(Size size, MusicalDuration duration) {
-    final glyph = switch (duration) {
-      MusicalDuration.whole => '\u{1D15D}', // birlik: glifin kendisi baştır
-      MusicalDuration.half => '\u{1D157}', // boş notabaşı
-      _ => '\u{1D158}', // siyah notabaşı
-    };
-    final painter = noteTextPainter(glyph, fontSize: _fontSize(size.height))
-      ..layout(maxWidth: size.width);
-    return painter.width;
-  }
+  // ---- Kiriş (beam) grubu ------------------------------------------------------
 
-  /// Baş merkezi y'si: staff'ın ilk boşluğundaki notanın merkezi + staff
-  /// pozisyonu başına yarım çizgi aralığı (uzatma noktalarıyla aynı formül).
-  double _headCenterY(int indexFromClefFirstSpace) {
-    final lineSpacing = (_measureExactHeight - _lineStrokeWidth + 1) / 4;
-    return _measureDescent +
-        _lineStrokeWidth / 2 -
-        1 +
-        lineSpacing * 3.5 +
-        indexFromClefFirstSpace * _noteSpaceHeight;
-  }
-
-  /// Ters saplı (stem-down) nota/akoru parçalardan kurar.
+  /// Kiriş grubunu çizer: ortak sap yönü, kirişe uzayan saplar, birincil kiriş
+  /// ve süreye göre ikincil kirişler / kısmi kiriş uçları (beamlet).
   ///
-  /// - Notabaşı glifi (U+1D158 / yarımlıkta U+1D157): doğru eğim
-  /// - Tek ortak sap: en tiz başın merkezinden en pes başın ~3.5 boşluk
-  ///   altına, başların sol kenarında
-  /// - Bayrak (U+1D16E/U+1D16F) sap dibinde dikeyde çevrilir: kıvrım sağa
-  /// - İkili aralığın (second) başı sapın soluna ofsetlenir
-  double _drawStemDownChord({
-    required Canvas canvas,
-    required Size size,
-    required MusicalValue value,
-    required List<MidiNote> sortedDescending,
-    required double dx,
-  }) {
-    final fontSize = _fontSize(size.height);
-    final drawColor = value.color ?? color;
-    final headPainter = noteTextPainter(
-      value.duration == MusicalDuration.half ? '\u{1D157}' : '\u{1D158}',
-      fontSize: fontSize,
-      color: drawColor,
-    )..layout(maxWidth: size.width);
-    final headW = headPainter.width;
-
-    // Ön geçiş: her notabaşının sap'a göre yönü (bitişik ikilinin ikinci
-    // notası sapın soluna gider) ve porte konumu.
-    var previousWasLeft = false;
-    final indices = <int>[];
-    final leftSide = <bool>[];
-    for (var i = 0; i < sortedDescending.length; i++) {
-      final note = sortedDescending[i];
-      var left = false;
-      if (i != 0 &&
-          !previousWasLeft &&
-          calculateIndexDifferenceBetweenFirstNoteToSecondNote(sortedDescending[i - 1], note) ==
-              1) {
-        left = true;
-      }
-      previousWasLeft = left;
-      indices.add(calculateNoteIndexDifferenceWithClefsFirstSpaceMidiNote(note));
-      leftSide.add(left);
-    }
-
-    // Sola kayan notabaşı, aksidanlarla birlikte aksidan bölgesine girip
-    // çakışır (aksidanlar bloğun soluna, notabaşından bağımsız çizilir).
-    // Bu durumda tüm nota bloğunu bir notabaşı genişliği sağa alırız;
-    // aksidansız bitişik akorlar (sol kaymanın sorun olmadığı yer) etkilenmez.
-    final hasLeftHead = leftSide.any((left) => left);
-    final hasAccidental = sortedDescending.any((note) => note.accidental != null);
-    if (hasLeftHead && hasAccidental) dx += headW;
-
-    // Çizim geçişi.
-    for (var i = 0; i < sortedDescending.length; i++) {
-      headPainter.paint(
-        canvas,
-        Offset(dx + (leftSide[i] ? -headW : 0), indices[i] * _noteSpaceHeight - .5),
-      );
-    }
-
-    final topIndex = indices.reduce(min);
-    final bottomIndex = indices.reduce(max);
-
-    final stemPaint =
-        Paint()
-          ..color = drawColor
-          ..strokeWidth = _lineStrokeWidth * 0.8;
-    final stemX = dx + _lineStrokeWidth / 2;
-    final stemBottomY = _headCenterY(bottomIndex) + _noteSpaceHeight * 7;
-    canvas.drawLine(Offset(stemX, _headCenterY(topIndex)), Offset(stemX, stemBottomY), stemPaint);
-
-    if (value.duration.value >= MusicalDuration.eighth.value) {
-      final flagPainter = noteTextPainter(
-        value.duration == MusicalDuration.eighth ? '\u{1D16E}' : '\u{1D16F}',
-        fontSize: fontSize,
-        color: drawColor,
-      )..layout(maxWidth: size.width);
-      // Dikey ayna: kıvrım yönü korunur (sağa), bağlantı ucu sap dibine
-      // gelir. Combining flag glifinin advance genişliği sıfır olduğundan
-      // yatay ofset de glif YÜKSEKLİĞİNE ölçeklenir; değerler NotoMusic
-      // için görsel kalibrasyondur (sol kenar sapla hizalı, üst uç sap
-      // dibine değer).
-      const flagDx = 0.021;
-      const flagDy = 0.31;
-      canvas.save();
-      canvas.translate(stemX, stemBottomY);
-      canvas.scale(1, -1);
-      flagPainter.paint(canvas, Offset(flagPainter.height * flagDx, -flagPainter.height * flagDy));
-      canvas.restore();
-    }
-
-    // Ek çizgiler: başlara ortalı; solda baş varsa sola uzar.
-    final linePaint =
-        Paint()
-          ..color = drawColor
-          ..strokeWidth = _lineStrokeWidth;
-    final anyLeft = leftSide.any((left) => left);
-    final lineFrom = dx + (anyLeft ? -headW : 0) - headW * 0.35;
-    final lineTo = dx + headW * 1.35;
-    final bottomLineCount = ((bottomIndex - bottomLimitIndex) / 2).ceil();
-    final topLineCount = ((topIndex - topLimitIndex) / 2).floor();
-    for (var i = 0; i < bottomLineCount; i++) {
-      final y = _measureDescent + _noteSpaceHeight * 2 * (i + 5) + 1;
-      canvas.drawLine(Offset(lineFrom, y), Offset(lineTo, y), linePaint);
-    }
-    for (var i = 0; i > topLineCount; i--) {
-      final y = _measureDescent + _noteSpaceHeight * 2 * (i - 1);
-      canvas.drawLine(Offset(lineFrom, y), Offset(lineTo, y), linePaint);
-    }
-
-    if (value.dotted) {
-      _drawAugmentationDots(
-        canvas: canvas,
-        notes: sortedDescending,
-        dx: dx,
-        noteWidth: headW,
-        color: value.color,
-      );
-    }
-    return headW;
-  }
-
-  /// returns the width of the accidentals
-  double drawAccidentals(
-    List<MidiNote> sortedNoteList,
+  /// Kiriş bir glif değildir: sap uçlarından geçen (eğimi sınırlanmış) çizgi
+  /// boyunca `beamThickness` kalınlığında paralelkenar olarak boyanır;
+  /// ikincil kirişler `beamThickness + beamSpacing` aralıkla notabaşlarına
+  /// doğru istiflenir (SMuFL `engravingDefaults`).
+  void _drawBeamGroup(
     Canvas canvas,
-    Size size,
-    double dx, {
-    Color? color,
-  }) {
-    var notesWithAccidentals = sortedNoteList.where((e) => e.accidental != null).toList();
-    var width = _measureLinePainter.width;
-    canvas.save();
-    canvas.translate(dx, 0);
-    for (var i = 0; i < notesWithAccidentals.length; i++) {
-      final note = notesWithAccidentals[i];
-      final noteIndexDifference = calculateNoteIndexDifferenceWithClefsFirstSpaceMidiNote(note);
-      final noteYOffset = noteIndexDifference * _noteSpaceHeight;
-      canvas.save();
-      canvas.translate(0, noteYOffset - _noteSpaceHeight * -2);
+    List<MusicalValue> values,
+    List<double> origins,
+  ) {
+    final n = values.length;
 
-      final accidentalPainter = noteTextPainter(
-        note.accidental!.symbol,
-        fontSize: _fontSize(size.height) * 0.8,
-        color: color,
-      )..layout(maxWidth: size.width);
-      accidentalPainter.paint(canvas, Offset.zero);
-      canvas.restore();
-      if (notesWithAccidentals.isNotEmpty) {
-        width += accidentalPainter.width + _measureLinePainter.width;
-        canvas.translate(accidentalPainter.width + _measureLinePainter.width, 0);
+    // 1) Yerleşim + grup sap yönü (tüm notaların ortalama porte konumu).
+    final layouts = [for (final v in values) _layoutIndices(v)];
+    final allIndices = [for (final l in layouts) ...l.indices];
+    final avgIndex = allIndices.reduce((a, b) => a + b) / allIndices.length;
+    final stemDown = avgIndex < -3; // ritim dizeğinde hep -3 → yukarı
+    final stemUp = !stemDown;
+
+    // 2) Başlar/aksidanlar/ek çizgiler/noktalar (bayrak çizilmez). Bağlar
+    // soldan sağa olay sırasıyla işlenir (kiriş içi ve kirişe giren bağlar).
+    for (var i = 0; i < n; i++) {
+      final noteX = _headOrigins(layouts[i].indices, stemUp, origins[i]);
+      final heads = _drawHeads(
+        canvas: canvas,
+        value: values[i],
+        notes: layouts[i].notes,
+        indices: layouts[i].indices,
+        noteX: noteX,
+        drawColor: values[i].color ?? color,
+      );
+      _handleTie(
+        canvas: canvas,
+        value: values[i],
+        heads: heads,
+        headW: Smufl.noteheadWidth * _sp, // kirişli süreler hep siyah baş
+        tieAbove: stemDown,
+        drawColor: values[i].color ?? color,
+      );
+    }
+
+    // 3) Sap geometrisi: x (sapın dikey kenarı), tutturma y'si, ideal uç.
+    final stemThk = Smufl.stemThickness * _sp;
+    final stemLen = Smufl.stemLength * _sp;
+    final stemX = <double>[];
+    final attachY = <double>[];
+    final idealTip = <double>[];
+    for (var i = 0; i < n; i++) {
+      final indices = layouts[i].indices;
+      final minIndex = indices.reduce((a, b) => a < b ? a : b);
+      final maxIndex = indices.reduce((a, b) => a > b ? a : b);
+      if (stemUp) {
+        final attach = _anchor(origins[i], _yForIndex(maxIndex), Smufl.stemUpSE);
+        stemX.add(attach.dx); // sağ kenar
+        attachY.add(attach.dy);
+        idealTip.add(_yForIndex(minIndex) - stemLen);
+      } else {
+        final attach = _anchor(origins[i], _yForIndex(minIndex), Smufl.stemDownNW);
+        stemX.add(attach.dx); // sol kenar
+        attachY.add(attach.dy);
+        idealTip.add(_yForIndex(maxIndex) + stemLen);
       }
     }
-    canvas.restore();
-    return width;
-  }
 
-  /// Dik saplı nota veya sus çizer (ters saplılar [_drawStemDownChord] ile
-  /// parçalardan kurulur).
-  double drawNote({
-    required Canvas canvas,
-    required Size size,
-    required String noteText,
-    required double dx,
-    required int indexFromClefFirstSpace,
-    bool isRest = false,
-    bool isVerticalRotated = false,
-    Color? color,
-  }) {
-    final notePainter = noteTextPainter(noteText, fontSize: _fontSize(size.height), color: color)
-      ..layout(maxWidth: size.width);
-    final noteYOffset = isRest ? 0.0 : indexFromClefFirstSpace * _noteSpaceHeight;
-    canvas.save();
-    canvas.translate(dx, noteYOffset);
-    if (isVerticalRotated) {
-      // Ayna uzayında -1.915w, ekranda ikinci notabaşını ana başların
-      // sağına koyar (dik akorda ikili aralık — doğru gravür konumu).
-      canvas.transform(Matrix4.rotationY(pi).storage);
-      canvas.translate(-notePainter.width * 1.915, 0);
+    // 4) Kiriş çizgisi: uç saplardan geçer, eğim ±1 sp ile sınırlanır, sonra
+    // hiçbir sap standart boydan (3.5 sp) kısa kalmayacak şekilde ötelenir
+    // (en yakın nota tam boyda, diğerleri uzar).
+    final x0 = stemX.first;
+    final x1 = stemX.last;
+    var rise = idealTip.last - idealTip.first;
+    if (rise > _sp) rise = _sp;
+    if (rise < -_sp) rise = -_sp;
+    final slope = x1 == x0 ? 0.0 : rise / (x1 - x0);
+    double lineAt(double x) => idealTip.first + slope * (x - x0);
+
+    var shift = idealTip[0] - lineAt(stemX[0]);
+    for (var i = 1; i < n; i++) {
+      final d = idealTip[i] - lineAt(stemX[i]);
+      if (stemUp ? d < shift : d > shift) shift = d;
     }
-    notePainter.paint(canvas, Offset.zero);
-    canvas.restore();
-    return notePainter.width;
-  }
+    double beamYAt(double x) => lineAt(x) + shift;
 
-  /// Noktalı değerin uzatma noktaları: her notabaşının sağına, boşluk
-  /// hizasına (çizgideki nota için bir üst boşluğa) çizilir.
-  void _drawAugmentationDots({
-    required Canvas canvas,
-    required List<MidiNote> notes,
-    required double dx,
-    required double noteWidth,
-    Color? color,
-  }) {
-    final paint =
-        Paint()
-          ..color = color ?? this.color
-          ..style = PaintingStyle.fill;
-    final radius = _noteSpaceHeight * 0.5;
-    // Notabaşları her iki sap yönünde de ~[0, w] kutusunda (yeni geometri);
-    // nokta tek kolonda, başların sağında durur.
-    final dotX = dx + noteWidth * 1.25 + radius;
-    final lineSpacing = (_measureExactHeight - _lineStrokeWidth + 1) / 4;
-    final firstSpaceCenterY = _measureDescent + _lineStrokeWidth / 2 - 1 + lineSpacing * 3.5;
-    for (final note in notes) {
-      var index = calculateNoteIndexDifferenceWithClefsFirstSpaceMidiNote(note);
-      if (index.isOdd) index -= 1; // çizgideki nota → bir üst boşluk
-      final y = firstSpaceCenterY + index * _noteSpaceHeight;
-      canvas.drawCircle(Offset(dotX, y), radius, paint);
+    // 5) Saplar: tutturma noktasından kiriş çizgisine.
+    for (var i = 0; i < n; i++) {
+      final tipY = beamYAt(stemX[i]);
+      final drawColor = values[i].color ?? color;
+      if (stemUp) {
+        canvas.drawRect(
+          Rect.fromLTRB(stemX[i] - stemThk, tipY, stemX[i], attachY[i]),
+          _fill(drawColor),
+        );
+      } else {
+        canvas.drawRect(
+          Rect.fromLTRB(stemX[i], attachY[i], stemX[i] + stemThk, tipY),
+          _fill(drawColor),
+        );
+      }
+    }
+
+    // 6) Kirişler. Grup rengi: bütün değerler aynı rengi taşıyorsa o, yoksa
+    // painter rengi.
+    final firstColor = values.first.color;
+    final beamColor =
+        values.every((v) => v.color == firstColor)
+            ? (firstColor ?? color)
+            : color;
+    final beamFill = _fill(beamColor);
+    final beamThkPx = Smufl.beamThickness * _sp;
+    final levelStep = (Smufl.beamThickness + Smufl.beamSpacing) * _sp;
+    final towardHeads = stemUp ? 1.0 : -1.0;
+
+    double leftEdge(int i) => stemUp ? stemX[i] - stemThk : stemX[i];
+    double rightEdge(int i) => stemUp ? stemX[i] : stemX[i] + stemThk;
+
+    void beamRect(double xa, double xb, int level) {
+      final off = (level - 1) * levelStep * towardHeads;
+      final ya = beamYAt(xa) + off;
+      final yb = beamYAt(xb) + off;
+      final h = beamThkPx * towardHeads;
+      final path =
+          Path()
+            ..moveTo(xa, ya)
+            ..lineTo(xb, yb)
+            ..lineTo(xb, yb + h)
+            ..lineTo(xa, ya + h)
+            ..close();
+      canvas.drawPath(path, beamFill);
+    }
+
+    // Birincil kiriş bütün grubu kapsar (Beam sözleşmesi: hepsi ≥ sekizlik).
+    beamRect(leftEdge(0), rightEdge(n - 1), 1);
+
+    // İkincil kirişler: seviye k, ardışık koşuları birleştirir; tek kalan nota
+    // kısmi kiriş ucu (beamlet) alır — solunda komşusu varsa sola, yoksa sağa
+    // bakar (noktalı sekizlik + onaltılık kalıbının standart yazımı).
+    final levels = [for (final v in values) Smufl.beamCountOf(v.duration)];
+    final maxLevel = levels.reduce((a, b) => a > b ? a : b);
+    final beamletLen = Smufl.noteheadWidth * _sp;
+    for (var k = 2; k <= maxLevel; k++) {
+      var i = 0;
+      while (i < n) {
+        if (levels[i] < k) {
+          i++;
+          continue;
+        }
+        var j = i;
+        while (j + 1 < n && levels[j + 1] >= k) {
+          j++;
+        }
+        if (j > i) {
+          beamRect(leftEdge(i), rightEdge(j), k);
+        } else if (i > 0) {
+          beamRect(rightEdge(i) - beamletLen, rightEdge(i), k);
+        } else {
+          beamRect(leftEdge(i), leftEdge(i) + beamletLen, k);
+        }
+        i = j + 1;
+      }
     }
   }
 
-  /// Dik saplı notaların ek (ledger) çizgileri. Uzunluk, glif genişliğine
-  /// değil notabaşı genişliğine ([headWidth]) dayanır — bayraklı gliflerde
-  /// çizginin gereğinden uzun çıkmasını önler.
-  void drawExtraLines({
-    required Canvas canvas,
-    required Size size,
-    required MusicalValue note,
-    required double dx,
-    required String noteSymbol,
-    required List<MidiNote> verticalRotatedNotes,
-    required double headWidth,
-  }) {
-    final notePainter = noteTextPainter(noteSymbol, fontSize: _fontSize(size.height))
-      ..layout(maxWidth: size.width);
-    final lowestNoteSpace = calculateNoteIndexDifferenceWithClefsFirstSpaceMidiNote(
-      note.midiNotes.first,
-    );
-    final highestNoteSpace = calculateNoteIndexDifferenceWithClefsFirstSpaceMidiNote(
-      note.midiNotes.last,
-    );
+  // ---- Aksidan / ek çizgi / nokta ----------------------------------------------
 
-    final bottomLineCount = ((lowestNoteSpace - bottomLimitIndex) / 2).ceil();
-    final topLineCount = ((highestNoteSpace - topLimitIndex) / 2).floor();
-    canvas.save();
-    canvas.translate(dx, 0);
+  void _drawAccidentals(
+    Canvas canvas,
+    List<MidiNote> notes,
+    List<int> indices,
+    double blockLeft,
+    Color color,
+  ) {
+    // En tizden (üst) pese doğru; dikey olarak çakışan (2.5 sp'den yakın)
+    // aksidanları bir öncekinin soluna kaydırarak istifler.
+    final withAcc = <({int index, MidiNote note})>[
+      for (var i = 0; i < notes.length; i++)
+        if (notes[i].accidental != null) (index: indices[i], note: notes[i]),
+    ]..sort((a, b) => a.index.compareTo(b.index));
+
+    final baseRight = blockLeft - 0.3 * _sp;
+    double? prevY, prevLeft;
+    for (final entry in withAcc) {
+      final glyph = Smufl.accidental(entry.note.accidental!);
+      final w = _glyphWidth(glyph);
+      final y = _yForIndex(entry.index);
+      final double right;
+      if (prevY != null && (prevY - y).abs() < 2.5 * _sp) {
+        right = prevLeft! - 0.15 * _sp;
+      } else {
+        right = baseRight;
+      }
+      final originX = right - w;
+      _drawGlyph(canvas, glyph, originX, y, color: color);
+      prevY = y;
+      prevLeft = originX;
+    }
+  }
+
+  void _drawLedgerLines(
+    Canvas canvas,
+    List<({int index, double x})> heads,
+    double headW,
+    Color color,
+  ) {
+    if (rhythmStaff) return; // tek çizgili dizekte ek çizgi yoktur
     final paint =
         Paint()
           ..color = color
-          ..strokeWidth = _lineStrokeWidth;
+          ..strokeWidth = Smufl.legerLineThickness * _sp;
+    final ext = Smufl.legerLineExtension * _sp;
 
-    double bottomY(int i) => _measureDescent + _noteSpaceHeight * 2 * (i + 5) + 1;
-    double topY(int i) => _measureDescent + _noteSpaceHeight * 2 * (i - 1) + 1;
-    void line(double fromX, double toX, double y) =>
-        canvas.drawLine(Offset(fromX, y), Offset(toX, y), paint);
+    void drawSide(bool below) {
+      final sideHeads =
+          heads
+              .where((h) => below ? h.index > _bottomLineIndex : h.index < _topLineIndex)
+              .toList();
+      if (sideHeads.isEmpty) return;
+      final left = sideHeads.map((h) => h.x).reduce((a, b) => a < b ? a : b) - ext;
+      final right =
+          sideHeads.map((h) => h.x + headW).reduce((a, b) => a > b ? a : b) + ext;
 
-    // Ana başlar [0, headWidth] kutusunda; çizgi başa ortalanır.
-    for (int i = 0; i < bottomLineCount; i++) {
-      line(-headWidth * 0.35, headWidth * 1.35, bottomY(i));
-    }
-    for (int i = 0; i > topLineCount; i--) {
-      line(-headWidth * 0.35, headWidth * 1.35, topY(i));
-    }
-
-    if (verticalRotatedNotes.isNotEmpty) {
-      final rotatedLowestNoteSpace = calculateNoteIndexDifferenceWithClefsFirstSpaceMidiNote(
-        verticalRotatedNotes.first,
-      );
-      final rotatedHighestNoteSpace = calculateNoteIndexDifferenceWithClefsFirstSpaceMidiNote(
-        verticalRotatedNotes.last,
-      );
-      final bottomRotatedLineCount = ((rotatedLowestNoteSpace - bottomLimitIndex) / 2).ceil();
-      final topRotatedLineCount = ((rotatedHighestNoteSpace - topLimitIndex) / 2).floor();
-
-      // İkili aralığın (second) başı ana başların sağında; merkezi glif
-      // genişliğine bağlıdır (ayna + -1.915w ötelemesi).
-      final secondCenter = notePainter.width * 1.915 - headWidth / 2;
-      for (int i = 0; i < bottomRotatedLineCount; i++) {
-        line(secondCenter - headWidth * 0.85, secondCenter + headWidth * 0.85, bottomY(i));
-      }
-      for (int i = 0; i > topRotatedLineCount; i--) {
-        line(secondCenter - headWidth * 0.85, secondCenter + headWidth * 0.85, topY(i));
+      if (below) {
+        final maxIndex = sideHeads.map((h) => h.index).reduce((a, b) => a > b ? a : b);
+        for (var L = _bottomLineIndex + 2; L <= maxIndex; L += 2) {
+          final y = _yForIndex(L);
+          canvas.drawLine(Offset(left, y), Offset(right, y), paint);
+        }
+      } else {
+        final minIndex = sideHeads.map((h) => h.index).reduce((a, b) => a < b ? a : b);
+        for (var L = _topLineIndex - 2; L >= minIndex; L -= 2) {
+          final y = _yForIndex(L);
+          canvas.drawLine(Offset(left, y), Offset(right, y), paint);
+        }
       }
     }
-    canvas.restore();
+
+    drawSide(true);
+    drawSide(false);
   }
 
-  @override
-  void paint(Canvas canvas, Size size) {
-    _initializeDrawingElements(canvas, size);
-
-    // Center the canvas vertically
-    centerCanvasVertical(canvas, size);
-
-    // Draw a staff that fills the width of the canvas
-    drawStaff(canvas, size);
-
-    if (drawClef) {
-      // Draw the clef
-      _drawClef(canvas, size);
+  void _drawAugmentationDots(
+    Canvas canvas,
+    List<({int index, double x})> heads,
+    double headW,
+    Color color,
+  ) {
+    final maxRight =
+        heads.map((h) => h.x + headW).reduce((a, b) => a > b ? a : b);
+    final dotX = maxRight + 0.35 * _sp;
+    for (final h in heads) {
+      var index = h.index;
+      if (index.isOdd) index -= 1; // çizgideki nota → bir üst boşluk
+      _drawGlyph(canvas, Smufl.ch(Smufl.augmentationDot), dotX, _yForIndex(index),
+          color: color);
     }
-
-    if (drawTimeSignature) {
-      // Draw the time signature
-      _drawTimeSignature(canvas, size);
-    }
-
-    // Draw measures
-    drawMeasures(canvas, size);
-
-    // Draw notes
-    drawNotes(canvas, size);
-  }
-
-  TextStyle noteTextStyle({required double fontSize, bool isBold = false, Color? color}) =>
-      _notoMusicStyle(
-        fontSize,
-        isBold ? FontWeight.bold : FontWeight.normal,
-        color ?? this.color,
-        fontSize * -0.1,
-      );
-
-  TextPainter noteTextPainter(
-    String text, {
-    required double fontSize,
-    bool isBold = false,
-    Color? color,
-  }) {
-    return TextPainter(
-      text: TextSpan(
-        text: text,
-        style: noteTextStyle(fontSize: fontSize, isBold: isBold, color: color ?? this.color),
-      ),
-      textDirection: TextDirection.ltr,
-      textAlign: TextAlign.start,
-    );
-  }
-
-  int calculateIndexDifferenceBetweenFirstNoteToSecondNote(MidiNote midiNote1, MidiNote midiNote2) {
-    final int midiNote1ExactIndex = midiNote1.index + (midiNote1.octave * 7);
-    final int midiNote2ExactIndex = midiNote2.index + (midiNote2.octave * 7);
-    return midiNote1ExactIndex - midiNote2ExactIndex;
-  }
-
-  int calculateNoteIndexDifferenceWithClefsFirstSpaceMidiNote(MidiNote otherMidiNote) {
-    return calculateIndexDifferenceBetweenFirstNoteToSecondNote(
-      clef.firstSpaceMidiNote,
-      otherMidiNote,
-    );
   }
 
   @override
   bool shouldRepaint(covariant MusicNotationPainter oldDelegate) {
-    // Eski davranış her zaman `false` idi: tema/renk veya nota değişimi
-    // repaint tetiklemiyordu. Alan karşılaştırması güvenli yöndedir
-    // (values listesi kimlikle karşılaştırılır; yeni liste → repaint).
     return oldDelegate.beatsPerMeasure != beatsPerMeasure ||
         oldDelegate.beatUnit != beatUnit ||
-        oldDelegate.measureCount != measureCount ||
         oldDelegate.color != color ||
         oldDelegate.clef != clef ||
+        oldDelegate.keySignature != keySignature ||
         oldDelegate.isEnd != isEnd ||
         oldDelegate.horizontallyCenterNotes != horizontallyCenterNotes ||
         oldDelegate.drawClef != drawClef ||
         oldDelegate.drawTimeSignature != drawTimeSignature ||
-        !listEquals(oldDelegate.values, values);
+        oldDelegate.rhythmStaff != rhythmStaff ||
+        !listEquals(oldDelegate.measures, measures);
   }
 }
