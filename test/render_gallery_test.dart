@@ -13,7 +13,9 @@ import 'package:flutter_test/flutter_test.dart';
 /// render hatasında test kırmızıya düşer.
 Future<void> _loadFont() async {
   final bytes = File('fonts/Bravura.otf').readAsBytesSync();
-  final loader = FontLoader('Bravura')
+  // Painter fontu paket adıyla çözer (package: parametresi); test de aynı
+  // efektif aile adı altında yüklemeli.
+  final loader = FontLoader('packages/flutter_musical_notation/Bravura')
     ..addFont(Future.value(ByteData.view(bytes.buffer)));
   await loader.load();
 }

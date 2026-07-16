@@ -10,7 +10,7 @@ import 'package:flutter_test/flutter_test.dart';
 /// yüklenmez).
 Future<void> _loadFont() async {
   final bytes = File('fonts/Bravura.otf').readAsBytesSync();
-  final loader = FontLoader('Bravura')
+  final loader = FontLoader('packages/flutter_musical_notation/Bravura')
     ..addFont(Future.value(ByteData.view(bytes.buffer)));
   await loader.load();
 }

@@ -21,6 +21,12 @@ class Smufl {
 
   static const String fontFamily = 'Bravura';
 
+  /// Font bu pakette tanımlı olduğundan, bağımlı uygulamada
+  /// `packages/flutter_musical_notation/Bravura` adıyla paketlenir. TextStyle'a
+  /// bu paket adı verilmezse (düz 'Bravura'), font yalnızca paketin kendi
+  /// test/örneğinde çözülür; gerçek uygulamada glifler "tofu" kutusu çıkar.
+  static const String fontPackage = 'flutter_musical_notation';
+
   // ---- engravingDefaults (staff space) -------------------------------------
   static const double staffLineThickness = 0.13;
   static const double stemThickness = 0.12;

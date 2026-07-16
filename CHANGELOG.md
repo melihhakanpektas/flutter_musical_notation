@@ -1,3 +1,13 @@
+## 0.3.1
+
+* **Font çözümü düzeltmesi (bağımlı uygulamada "tofu" kutuları).** Painter
+  `TextStyle`'ı artık `package: 'flutter_musical_notation'` belirtiyor. Font bu
+  pakette tanımlı olduğundan bağımlı uygulamada `packages/flutter_musical_notation/
+  Bravura` adıyla paketlenir; düz `'Bravura'` referansı yalnızca paketin kendi
+  test/örneğinde çözülüyor, gerçek uygulamada glifler eksik glif kutusu olarak
+  çıkıyordu. `Smufl.fontPackage` eklendi. Paket testlerindeki `FontLoader` da
+  aynı efektif aile adını (`packages/flutter_musical_notation/Bravura`) yükler.
+
 ## 0.3.0
 
 **Bağ (tie) ve donanım (key signature) desteği** — sınav müfredatının iki

@@ -89,6 +89,7 @@ class MusicNotationPainter extends CustomPainter {
         text: glyph,
         style: TextStyle(
           fontFamily: Smufl.fontFamily,
+          package: Smufl.fontPackage,
           fontSize: _sp * sizeSp,
           color: color ?? this.color,
         ),
