@@ -1,6 +1,7 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_music_core/flutter_music_core.dart';
+import 'package:flutter_musical_notation/src/notation_layout.dart';
 import 'package:flutter_musical_notation/src/notation_measure.dart';
 import 'package:flutter_musical_notation/src/smufl.dart';
 
@@ -32,6 +33,27 @@ class MusicNotationPainter extends CustomPainter {
   final bool rhythmStaff;
   final List<NotationMeasure> measures;
 
+  /// Satır (sistem) başına **azami** ölçü sayısı; null = hepsi tek satırda.
+  /// Dar/dikey ekranda ölçüler alta sarsın diye. Her satır sağa kadar
+  /// doldurulur (bkz. [NotationLayout]).
+  final int? measuresPerLine;
+
+  /// Çalım imleci: değeri **birlik nota** cinsinden müzikal an (null = gizli).
+  /// Painter buna abone olur (`super.repaint`) — çubuk hareket ederken widget
+  /// yeniden kurulmaz, yalnız yeniden boyanır.
+  final ValueListenable<double?>? playhead;
+
+  final Color? playheadColor;
+
+  /// Notaların **altına** çizilen zaman-konumlu işaretler (kullanıcı tap geri
+  /// bildirimi: kırmızı nokta / yeşil onay / kırmızı çarpı). Playhead ve
+  /// dokunma ile aynı yerleşimi kullanır → hizası garantidir.
+  final List<NotationMarker> markers;
+
+  /// Widget'ın önceden hesapladığı yerleşim (imleç overlay'i ile **aynı**
+  /// instance paylaşılsın diye). null → paint kendi hesaplar/cache'ler.
+  final NotationLayout? presetLayout;
+
   MusicNotationPainter({
     this.beatsPerMeasure = 4,
     this.beatUnit = MusicalDuration.quarter,
@@ -44,11 +66,15 @@ class MusicNotationPainter extends CustomPainter {
     this.drawTimeSignature = true,
     this.rhythmStaff = false,
     this.measures = const [],
-  });
+    this.measuresPerLine,
+    this.playhead,
+    this.playheadColor,
+    this.markers = const [],
+    this.presetLayout,
+  }) : super(repaint: playhead);
 
   // Çizim boyunca sabit geometri (paint başında hesaplanır).
   late double _sp; // staff space (px)
-  late double _fontSize; // 4 * sp
   late double _centerY; // orta porte çizgisi (3. çizgi)
 
   /// Bağ (tie) için son çizilen nota olayının tutturma bilgisi: notabaşı
@@ -56,6 +82,12 @@ class MusicNotationPainter extends CustomPainter {
   /// sus görülünce temizlenir. Bağlar ölçü ve kiriş sınırlarını doğal olarak
   /// aşabilir (senkop yazımının gereği).
   ({List<({int index, double xLeft, double xRight})> heads})? _tiePrev;
+
+  /// Önceki nota olayının satırı ve çizilmekte olan satır: bağ, satır
+  /// (sistem) sınırını aşarsa **çizilmez** — x'ler başka sistemden gelir ve
+  /// eğri saçmalardı. (Sistem aşan bağın doğru yazımı ayrı bir iştir.)
+  int? _tiePrevLine;
+  int _currentLine = 0;
 
   // Porte çizgileri odd staff-index'te (üst -7 … alt +1), boşluklar even'de.
   static const int _topLineIndex = -7;
@@ -129,46 +161,144 @@ class MusicNotationPainter extends CustomPainter {
   // paint
   // ---------------------------------------------------------------------------
 
+  /// Yerleşim: zaman↔x eşlemesi ve ölçü geometrisi. Notaların x'i, dokunma
+  /// hedefleri ve playhead **aynı** hesaptan gelsin diye paint başında kurulur
+  /// (bkz. [NotationLayout]).
+  late NotationLayout _layout;
+
+  // Yerleşim cache'i: playhead/marker değişince painter **aynı** instance ile
+  // yeniden boyanır (super(repaint:) — widget kurulmaz), ama yerleşim TextPainter
+  // ile glif genişliği ölçtüğü için pahalıdır ve boyut/içerik değişmedikçe
+  // sabittir. İmleç 30 fps aksa da yerleşimi bir kez hesapla (cevap fazında
+  // sürekli akan imleç yoksa telefonu kastırırdı).
+  NotationLayout? _cachedLayout;
+  Size? _cachedLayoutSize;
+
   @override
   void paint(Canvas canvas, Size size) {
-    _fontSize = size.height / 3;
-    _sp = _fontSize / 4;
-    _centerY = size.height / 2;
+    if (presetLayout != null) {
+      _layout = presetLayout!;
+    } else {
+      if (_cachedLayout == null || _cachedLayoutSize != size) {
+        _cachedLayout = layoutFor(size);
+        _cachedLayoutSize = size;
+      }
+      _layout = _cachedLayout!;
+    }
+    _sp = _layout.sp;
     _tiePrev = null;
 
-    _drawStaffLines(canvas, size);
+    // Her satır (sistem) kendi porte/anahtar/barlarıyla çizilir; ölçü imi
+    // yalnız ilk satırda (gravür kuralı).
+    for (var line = 0; line < _layout.lineCount; line++) {
+      _centerY = _layout.centerYOf(line);
+      _currentLine = line;
+      _drawStaffLines(canvas, line);
 
-    double x = _sp; // sol kenar boşluğu
+      double x = _sp; // sol kenar boşluğu
+      if (drawClef) {
+        x += _drawClef(canvas, x) + _sp;
+      }
+      final keyW = _drawKeySignature(canvas, x);
+      if (keyW > 0) x += keyW + _sp;
+      if (drawTimeSignature && line == 0) {
+        x += _drawTimeSignature(canvas, x) + _sp;
+      }
+      assert(
+        (x - _layout.regionLeftOf(line)).abs() < 0.5,
+        'Yerleşim ile çizim ayrıştı (satır $line): nota bölgesi $x vs '
+        '${_layout.regionLeftOf(line)}. Ön ek (anahtar/donanım/ölçü imi) '
+        'genişlikleri NotationLayout ile aynı hesaplanmalı.',
+      );
 
-    if (drawClef) {
-      x += _drawClef(canvas, x) + _sp;
+      _drawBarlines(canvas, line);
+      _drawNotes(canvas, line);
     }
-    final keyW = _drawKeySignature(canvas, x);
-    if (keyW > 0) x += keyW + _sp;
-    if (drawTimeSignature) {
-      x += _drawTimeSignature(canvas, x) + _sp;
-    }
-
-    final endThickness =
-        (isEnd ? Smufl.thickBarlineThickness : Smufl.thinBarlineThickness) * _sp;
-    final regionLeft = x;
-    final regionRight = size.width - endThickness - _sp * 0.25;
-    final measureCount = measures.isEmpty ? 1 : measures.length;
-    final measureWidth = (regionRight - regionLeft) / measureCount;
-
-    _drawBarlines(canvas, regionLeft, measureWidth, measureCount);
-    _drawNotes(canvas, regionLeft, measureWidth);
+    _drawMarkers(canvas);
+    _drawPlayhead(canvas, size);
   }
 
-  void _drawStaffLines(Canvas canvas, Size size) {
+  /// Bu yapılandırmanın [size] için yerleşimi — widget hit-test'te kullanır.
+  NotationLayout layoutFor(Size size) => NotationLayout(
+        size: size,
+        beatsPerMeasure: beatsPerMeasure,
+        beatUnit: beatUnit,
+        clef: clef,
+        keySignature: keySignature,
+        isEnd: isEnd,
+        drawClef: drawClef,
+        drawTimeSignature: drawTimeSignature,
+        rhythmStaff: rhythmStaff,
+        measures: measures,
+        measuresPerLine: measuresPerLine,
+      );
+
+  /// Zaman-konumlu işaretler: her biri kendi anının x'inde, o anın **kendi
+  /// satırının** dizek bandının **altına** çizilir (kullanıcı tap geri
+  /// bildirimi). Nokta = dolu daire, onay = ✓, çarpı = ✗.
+  void _drawMarkers(Canvas canvas) {
+    for (final marker in markers) {
+      final x = _layout.xForTime(marker.time);
+      final centerY = _layout.centerYOf(_layout.lineForTime(marker.time));
+      // Notaların/barın (±2 sp) altında; ek çizgilere ve saplara girmeyecek yer.
+      final y = centerY + 3.2 * _sp;
+      final r = 0.7 * _sp;
+      final paint = Paint()
+        ..color = marker.color
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = Smufl.stemThickness * _sp * 1.6
+        ..strokeCap = StrokeCap.round;
+      switch (marker.kind) {
+        case NotationMarkerKind.dot:
+          canvas.drawCircle(Offset(x, y), r, _fill(marker.color));
+        case NotationMarkerKind.check:
+          canvas.drawPath(
+            Path()
+              ..moveTo(x - r, y)
+              ..lineTo(x - r * 0.25, y + r * 0.8)
+              ..lineTo(x + r, y - r * 0.9),
+            paint,
+          );
+        case NotationMarkerKind.cross:
+          canvas
+            ..drawLine(Offset(x - r, y - r), Offset(x + r, y + r), paint)
+            ..drawLine(Offset(x + r, y - r), Offset(x - r, y + r), paint);
+      }
+    }
+  }
+
+  /// Çalım imleci: müzikal anın x'inde dikey çubuk (MuseScore/Finale deseni).
+  /// Çok satırlıda o anın **kendi satırında** çizilir.
+  void _drawPlayhead(Canvas canvas, Size size) {
+    final time = playhead?.value;
+    if (time == null) return;
+    final x = _layout.xForTime(time);
+    final centerY = _layout.centerYOf(_layout.lineForTime(time));
+    final paint = Paint()
+      ..color = playheadColor ?? color
+      ..strokeWidth = Smufl.stemThickness * _sp * 1.5;
+    // Porte yüksekliğinin biraz dışına taşar ki notaların arasında kaybolmasın.
+    canvas.drawLine(
+      Offset(x, centerY - 3 * _sp),
+      Offset(x, centerY + 3 * _sp),
+      paint,
+    );
+  }
+
+  /// [line] satırının porte çizgileri: soldan **o satırın son bar
+  /// çizgisine** kadar (her satır doldurulduğundan bu sağ kenardır; dizek
+  /// bitiş barının ötesine taşmaz).
+  void _drawStaffLines(Canvas canvas, int line) {
     final paint =
         Paint()
           ..color = color
           ..strokeWidth = Smufl.staffLineThickness * _sp;
-    final lineCount = rhythmStaff ? 1 : 5;
-    for (int k = 0; k < lineCount; k++) {
-      final y = _centerY + (k - (lineCount - 1) / 2) * _sp;
-      canvas.drawLine(Offset(0, y), Offset(size.width, y), paint);
+    final right = _layout.regionLeftOf(line) +
+        _layout.measuresInLine(line) * _layout.measureWidthOf(line);
+    final staffLineCount = rhythmStaff ? 1 : 5;
+    for (int k = 0; k < staffLineCount; k++) {
+      final y = _centerY + (k - (staffLineCount - 1) / 2) * _sp;
+      canvas.drawLine(Offset(0, y), Offset(right, y), paint);
     }
   }
 
@@ -255,18 +385,19 @@ class MusicNotationPainter extends CustomPainter {
     return totalW;
   }
 
-  void _drawBarlines(
-    Canvas canvas,
-    double regionLeft,
-    double measureWidth,
-    int measureCount,
-  ) {
+  /// [line] satırındaki ölçülerin bar çizgileri. Kalın bitiş barı yalnız
+  /// **son satırın son ölçüsünde** (yarım kalan satır erken biter, esnemez).
+  void _drawBarlines(Canvas canvas, int line) {
     // Tek çizgili dizekte de barlar standart porte yüksekliğinde (4 sp) çizilir.
     final topY = _centerY - 2 * _sp;
     final bottomY = _centerY + 2 * _sp;
-    for (int i = 1; i <= measureCount; i++) {
+    final regionLeft = _layout.regionLeftOf(line);
+    final measureWidth = _layout.measureWidthOf(line);
+    final count = _layout.measuresInLine(line);
+    final isLastLine = line == _layout.lineCount - 1;
+    for (int i = 1; i <= count; i++) {
       final boundaryX = regionLeft + i * measureWidth;
-      final isFinal = i == measureCount && isEnd;
+      final isFinal = isLastLine && i == count && isEnd;
       final thickness =
           (isFinal ? Smufl.thickBarlineThickness : Smufl.thinBarlineThickness) *
           _sp;
@@ -281,24 +412,29 @@ class MusicNotationPainter extends CustomPainter {
   // Notalar
   // ---------------------------------------------------------------------------
 
-  void _drawNotes(Canvas canvas, double regionLeft, double measureWidth) {
-    final measureTimeLength = beatsPerMeasure * (1 / beatUnit.value);
+  /// [line] satırındaki ölçülerin notaları.
+  void _drawNotes(Canvas canvas, int line) {
+    final measureTimeLength = _layout.measureTimeLength;
+    final first = line * _layout.measuresPerLine;
+    // Yerleşim, içerik boşken de bir ölçü sayar (boş dizek/bar çizilsin diye);
+    // nota döngüsü gerçek liste uzunluğuyla sınırlanır.
+    var last = first + _layout.measuresInLine(line);
+    if (last > measures.length) last = measures.length;
 
-    for (var m = 0; m < measures.length; m++) {
+    for (var m = first; m < last; m++) {
       final measure = measures[m];
       assert(
         measure.timeLength <= measureTimeLength + 1e-9,
         'Ölçü ${m + 1} taşıyor: ${measure.timeLength} > $measureTimeLength '
         '($beatsPerMeasure/${beatUnit.value})',
       );
-      final innerLeft = regionLeft + m * measureWidth + measureWidth * 0.06;
-      final innerWidth = measureWidth * 0.88;
 
+      // Nota x'i yerleşimden gelir; ortalama seçeneği yalnız glifi slot
+      // içinde kaydırır (dokunma/playhead slot'a bakar, kaymaz).
       double originXAt(double cursorTime, MusicalValue value) {
-        final slotX =
-            innerLeft + (cursorTime / measureTimeLength) * innerWidth;
+        final slotX = _layout.slotX(m, cursorTime);
         if (!horizontallyCenterNotes) return slotX;
-        final slotW = (value.timeLength / measureTimeLength) * innerWidth;
+        final slotW = _layout.slotX(m, cursorTime + value.timeLength) - slotX;
         final headW = Smufl.noteheadWidthOf(value.duration) * _sp;
         return slotX + slotW / 2 - headW / 2;
       }
@@ -416,7 +552,8 @@ class MusicNotationPainter extends CustomPainter {
         prev != null,
         'tiedToPrevious: önceki nota yok (ilk değer ya da sus sonrası).',
       );
-      if (prev != null) {
+      // Sistem (satır) aşan bağ çizilmez: uçlar farklı satırlarda olurdu.
+      if (prev != null && _tiePrevLine == _currentLine) {
         var drawn = false;
         for (final h in heads) {
           // Aynı porte konumundaki önceki başlardan en sağdakine bağlan.
@@ -445,6 +582,7 @@ class MusicNotationPainter extends CustomPainter {
         for (final h in heads) (index: h.index, xLeft: h.x, xRight: h.x + headW),
       ],
     );
+    _tiePrevLine = _currentLine;
   }
 
   /// Bağ eğrisi: uçları ince, ortası `tieMidpointThickness` kalınlığında
@@ -876,6 +1014,9 @@ class MusicNotationPainter extends CustomPainter {
         oldDelegate.drawClef != drawClef ||
         oldDelegate.drawTimeSignature != drawTimeSignature ||
         oldDelegate.rhythmStaff != rhythmStaff ||
+        oldDelegate.playhead != playhead ||
+        oldDelegate.playheadColor != playheadColor ||
+        !listEquals(oldDelegate.markers, markers) ||
         !listEquals(oldDelegate.measures, measures);
   }
 }

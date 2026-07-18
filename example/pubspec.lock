@@ -84,14 +84,14 @@ packages:
       path: "../../flutter_music_core"
       relative: true
     source: path
-    version: "0.0.1"
+    version: "0.0.2"
   flutter_musical_notation:
     dependency: "direct main"
     description:
       path: ".."
       relative: true
     source: path
-    version: "0.0.1"
+    version: "0.4.0"
   flutter_test:
     dependency: "direct dev"
     description: flutter

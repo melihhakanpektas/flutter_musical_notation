@@ -1076,5 +1076,83 @@ void main() {
       width: 900,
       height: 320,
     );
+
+    // 45) Çok satır (measuresPerLine): dar/dikey ekranda 4 ölçülük ritim
+    // ikişerli iki satıra sarar. Ölçü imi yalnız ilk satırda, anahtar her
+    // satırda. (44'teki elle istiflemenin otomatik hâli.)
+    await _render(
+      tester,
+      '45_cok_satir_ritim_2_4',
+      MusicNotation.rhythm(
+        beatsPerMeasure: 2,
+        measuresPerLine: 2,
+        height: 100, // satır BAŞINA
+        measures: [
+          for (var i = 0; i < 4; i++)
+            NotationMeasure([
+              Single(_v(MusicalDuration.quarter, [_n(0, 4)])),
+              Beam([
+                _v(MusicalDuration.eighth, [_n(0, 4)]),
+                _v(MusicalDuration.eighth, [_n(0, 4)]),
+              ]),
+            ]),
+        ],
+      ),
+      width: 390, // telefon genişliği (dikey)
+      height: 200,
+    );
+
+    // 46) Çok satır, yarım kalan son satır: 3 ölçü → 2+1. **Her satır dolar**:
+    // ikinci satırdaki tek ölçü satırı tam kaplar.
+    await _render(
+      tester,
+      '46_cok_satir_yarim_son',
+      MusicNotation(
+        beatsPerMeasure: 2,
+        measuresPerLine: 2,
+        height: 110,
+        measures: [
+          NotationMeasure([
+            Beam([
+              _v(MusicalDuration.eighth, [_n(4, 4)]),
+              _v(MusicalDuration.eighth, [_n(5, 4)]),
+            ]),
+            Single(_v(MusicalDuration.quarter, [_n(6, 4)])),
+          ]),
+          NotationMeasure([
+            Single(_v(MusicalDuration.quarter, [_n(1, 5)])),
+            Single(_v(MusicalDuration.quarter, [_n(0, 5)])),
+          ]),
+          NotationMeasure([
+            Single(_v(MusicalDuration.half, [_n(4, 4)])),
+          ]),
+        ],
+      ),
+      width: 390,
+      height: 220,
+    );
+
+    // 47) measuresPerLine=2 ama tek ölçülük patern: satır yarım kalmaz,
+    // tek ölçü satırı doldurur.
+    await _render(
+      tester,
+      '47_cok_satir_tek_olcu',
+      MusicNotation.rhythm(
+        beatsPerMeasure: 2,
+        measuresPerLine: 2,
+        height: 100,
+        measures: [
+          NotationMeasure([
+            Single(_v(MusicalDuration.quarter, [_n(0, 4)])),
+            Beam([
+              _v(MusicalDuration.eighth, [_n(0, 4)]),
+              _v(MusicalDuration.eighth, [_n(0, 4)]),
+            ]),
+          ]),
+        ],
+      ),
+      width: 390,
+      height: 110,
+    );
   });
 }
